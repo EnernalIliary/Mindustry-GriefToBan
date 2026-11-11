@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# build / local artifacts (release zips go to GitHub Releases, not the tree)
+out/
+dist/
+build/
+*.zip
+
+# local sandbox
+config/
+*.log
