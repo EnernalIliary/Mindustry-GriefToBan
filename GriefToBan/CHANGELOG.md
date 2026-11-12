@@ -2,6 +2,21 @@
 
 只记对外可见的变化。工程细节见 `out/takeover-20261024/` 下的报告。
 
+## 0.1.7
+
+用户 m10997：「你放置的建筑不是原建筑，而是@air，而且应该检测拆除行为，而不是等完全拆除再拉黑」
+
+- **放回去的终于是原建筑了**：以前挂的是「拆完」事件，那时候 `tile.block()` 已经是
+  `ConstructBlock`（原方块被挪进 `ConstructBuild.previous`，而它的默认值正是 `Blocks.air`），
+  于是放回去的是一个空壳构造块 —— 画面上就是一片空白（@air）。现在快照直接从
+  `ConstructBlock` 里取：`previous` 是原方块，`prevBuild.get(0)` 是还带着物品与液体的旧建筑。
+- **拆除「刚开始」就判，不再等拆完**：改挂 `BlockBuildBeginEvent(breaking = true)`
+  （`Build.beginBreak` 把 tile 换成 ConstructBlock 之后、方块被移除之前触发）。判中就直接
+  把 ConstructBlock 换回原方块 —— 等于当场撤销这次拆除；「拆完」事件只留作兜底
+  （`instantDeconstruct` 的方块不触发 begin，以及 begin 时没能立刻放回的情况）。
+- 联机时放回走 `Tile.setNet`（`Call.setTile`），只主机自己看得见的问题一并修掉；
+  落不下去就退回 `setBlock`。
+
 ## 0.1.6
 
 用户 m10864：「合并到交互多次的时间里吧沿用它们的时间。全部还原」

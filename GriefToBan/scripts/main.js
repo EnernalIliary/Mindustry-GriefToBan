@@ -702,6 +702,11 @@ var GTB_GENS = {};
 // 进服后的第一个动作：如果第一件事就是拆建筑，直接拉黑 + 通告，并把建筑按原样放回去。
 // 只跟踪「刚进服、还没做过任何别的事」的人；建方块 / 改配置 / 控单位 / 指挥都算做过别的事。
 var GTB_FIRST = {};
+// 正在被拆、但还没拆完的建筑：键是 tileKey，值是 { snap, name }。
+// 拆除一开始（Build.beginBreak）tile 就被换成 ConstructBlock、原方块存进 previous，
+// 等到 deconstructFinish 时 tile.block() 已经是 build1/2/3 —— 拿它还原会得到一个
+// previous=air 的构造块，看上去就是"放回去的是空的"。所以快照必须在拆的一开始做。
+var GTB_BREAK = {};
 
 function firstMark(p) {
     var uuid = uuidOf(p);
@@ -784,6 +789,35 @@ function restoreInventory(b, snap) {
     } catch (e4) { }
 }
 
+function isConstructBlock(b) {
+    if (b == null) return false;
+    try { return b instanceof Packages.mindustry.world.blocks.ConstructBlock; } catch (e) { return false; }
+}
+
+// 拆除刚开始时的快照：这时候 tile.block() 已经变成 ConstructBlock，
+// 原方块在 cb.previous、原建筑实例（还带着物品与液体）在 cb.prevBuild[0]。
+function breakSnapshot(t, cb) {
+    if (t == null || cb == null) return null;
+    var snap = { block: null, team: null, rot: 0, conf: null, hp: 1, items: null, liquids: null };
+    try { snap.block = cb.previous; } catch (e1) { snap.block = null; }
+    try { if (snap.block === Packages.mindustry.content.Blocks.air) snap.block = null; } catch (e2) { }
+    if (snap.block == null) return null;
+    var old = null;
+    try { if (cb.prevBuild != null && cb.prevBuild.size > 0) old = cb.prevBuild.get(0); } catch (e3) { old = null; }
+    if (old != null) {
+        try { snap.team = old.team; } catch (e4) { }
+        try { snap.rot = old.rotation; } catch (e5) { }
+        try { snap.conf = old.config(); } catch (e6) { }
+        try { snap.hp = old.healthf(); } catch (e7) { }
+        try { if (old.items != null) snap.items = itemSnapshot(old.items); } catch (e8) { }
+        try { if (old.liquids != null) snap.liquids = liquidSnapshot(old.liquids); } catch (e9) { }
+    } else {
+        try { snap.rot = cb.rotation; } catch (e10) { }
+    }
+    if (snap.team == null) { try { snap.team = t.team(); } catch (e11) { } }
+    return snap;
+}
+
 // 拆除事件发生在 tile.remove() 之前 ⇒ 这时候还能读到原方块的种类 / 队伍 / 朝向 / 配置 / 血量 / 库存
 function tileSnapshot(t) {
     if (t == null) return null;
@@ -803,13 +837,28 @@ function tileSnapshot(t) {
     return snap.block == null ? null : snap;
 }
 
-// 放回原方块：只在原位已经空了（tile.remove() 之后是 air）时才动，避免盖掉别人刚铺的东西
-function restoreTile(t, snap) {
+// 联机时服务端改图要走 setNet（Call.setTile），否则只有主机自己看得见；
+// 有的版本 setNet 只发不收，落不下去就退回 setBlock。
+function placeBlock(t, snap) {
+    var on = false;
+    try { on = Packages.mindustry.Vars.net != null && Packages.mindustry.Vars.net.active() === true; } catch (e1) { on = false; }
+    if (on) {
+        try { t.setNet(snap.block, snap.team, snap.rot); } catch (e2) { }
+        try { if (t.block() === snap.block) return true; } catch (e3) { }
+    }
+    t.setBlock(snap.block, snap.team, snap.rot);
+    return true;
+}
+
+// 放回原方块。allowConstruct=true 时允许覆盖正在拆的 ConstructBlock（拆除刚开始就原地撤销）；
+// 否则只在原位已经空了（tile.remove() 之后是 air）时才动，避免盖掉别人刚铺的东西。
+function restoreTile(t, snap, allowConstruct) {
     if (t == null || snap == null) return false;
     try {
         var air = Packages.mindustry.content.Blocks.air;
-        if (t.block() !== air) return false;
-        t.setBlock(snap.block, snap.team, snap.rot);
+        var cur = t.block();
+        if (cur !== air && !(allowConstruct === true && isConstructBlock(cur))) return false;
+        placeBlock(t, snap);
         var nb = t.build;
         if (nb != null) {
             try { if (snap.hp < 1) nb.health = snap.block.health * snap.hp; } catch (e1) { }
@@ -820,14 +869,49 @@ function restoreTile(t, snap) {
     } catch (e) { logErr("restore: " + e); return false; }
 }
 
+// 拆除刚开始（Build.beginBreak 里 tile 已换成 ConstructBlock 之后触发）：这一瞬间就能判，
+// 不用等方块真的被拆完；而且原地把 ConstructBlock 换回原方块就等于撤销了这次拆除。
+function firstBreakBegin(e, p) {
+    if (p == null || !firstPending(p)) return false;
+    var cfg0 = cfg();
+    if (!cfg0.enable || !cfg0.bh.firstBreak) { firstClear(p); return false; }
+    if (!firstRecent(p, cfg0.thInteractWindow)) { firstClear(p); return false; }
+    if (isAdmin(p) || targetOf(p) !== "target") { firstClear(p); return false; }
+    var t = null, cb = null, snap = null;
+    try { t = e.tile; } catch (e1) { t = null; }
+    try { cb = t == null ? null : t.build; } catch (e2) { cb = null; }
+    if (!isConstructBlock(cb)) return false;
+    try { snap = breakSnapshot(t, cb); } catch (e3) { snap = null; }
+    if (snap == null) return false;
+    var nm = nameOf(p);
+    var key = tileKey(t);
+    firstClear(p);
+    punish(p, LIB.REASON.firstBreak);
+    if (key !== "") GTB_BREAK[key] = { snap: snap, name: nm };
+    var back = false;
+    try { back = restoreTile(t, snap, true); } catch (e4) { back = false; }
+    if (back) {
+        if (key !== "") delete GTB_BREAK[key];
+        broadcast(LIB.textInfo("已把 " + nm + " 拆掉的建筑放回原处。"));
+    }
+    return back;
+}
+
+// 兜底：instantDeconstruct 的方块不触发 begin 事件（Build.beginBreak 里直接 deconstructFinish）；
+// 以及 begin 时没能立刻放回的情况，在这里按拆除结束事件处理。
 function firstBreakCheck(e, p) {
     if (p == null || !firstPending(p)) return;
     var cfg0 = cfg();
     if (!cfg0.enable || !cfg0.bh.firstBreak) { firstClear(p); return; }
     if (!firstRecent(p, cfg0.thInteractWindow)) { firstClear(p); return; }
     if (isAdmin(p) || targetOf(p) !== "target") { firstClear(p); return; }
-    var t = null, snap = null;
+    var t = null, cur = null, snap = null;
     try { t = e.tile; } catch (e1) { t = null; }
+    try { cur = t == null ? null : t.block(); } catch (e0) { cur = null; }
+    if (isConstructBlock(cur)) {
+        // 拆除中途：原方块在 GTB_BREAK 里（onBuildEnd 的 breaking 分支会用），这里不重复处置
+        return;
+    }
     try { snap = tileSnapshot(t); } catch (e2) { snap = null; }
     var nm = nameOf(p);
     firstClear(p);
@@ -1137,6 +1221,20 @@ function onLeave(p) {
 
 // ---------------------------------------------------------------- 事件
 
+// 拆方块的第一步：Build.beginBreak 把 tile 换成 ConstructBlock 后触发，此时方块还没被移除。
+// 在这里判「进服第一个动作就是拆」，并当场把 ConstructBlock 换回原方块 —— 等于撤销这次拆除。
+function onBuildBegin(e) {
+    if (!isAuthority()) return;
+    if (inEditor()) return;
+    if (e.breaking !== true) return;
+    var cfg0 = cfg();
+    if (!cfg0.enable) return;
+    var p = null;
+    try { var u = e.unit; if (u != null) p = u.getPlayer(); } catch (e0) { p = null; }
+    if (p == null) return;
+    try { firstBreakBegin(e, p); } catch (eB) { logErr("first break begin: " + eB); }
+}
+
 function onBuildEnd(e) {
     if (!isAuthority()) return;
     if (inEditor()) return;                 // 编辑器：既不改 enabled，也不记建造者
@@ -1145,6 +1243,24 @@ function onBuildEnd(e) {
     // 拆建筑（ConstructBlock.deconstructFinish 里 tile.remove() 之前触发，带 builder 单位）：
     // 只有「进服后第一个动作就是拆」要处置 —— 拉黑 + 通告 + 把建筑按原样放回去。
     if (e.breaking === true) {
+        var tEnd = null, pend = null, kEnd = "";
+        try { tEnd = e.tile; } catch (eT) { tEnd = null; }
+        try { kEnd = tEnd == null ? "" : tileKey(tEnd); } catch (eK) { kEnd = ""; }
+        if (kEnd !== "") pend = GTB_BREAK[kEnd] == null ? null : GTB_BREAK[kEnd];
+        if (pend != null) {
+            // begin 时已经判过（人已拉黑）：只负责把方块放回去
+            if (kEnd !== "") delete GTB_BREAK[kEnd];
+            (function (tt, sp, nm) {
+                Packages.arc.Core.app.post(function () {
+                    try {
+                        if (restoreTile(tt, sp)) {
+                            broadcast(LIB.textInfo("已把 " + nm + " 拆掉的建筑放回原处。"));
+                        }
+                    } catch (e5) { logErr("restore post: " + e5); }
+                });
+            })(tEnd, pend.snap, pend.name);
+            return;
+        }
         var pb = null;
         try { var ub = e.unit; if (ub != null) pb = ub.getPlayer(); } catch (e0) { pb = null; }
         if (pb != null) { try { firstBreakCheck(e, pb); } catch (eB) { logErr("first break: " + eB); } }
@@ -1490,6 +1606,8 @@ function bindEvents() {
     Events.on(ET.PlayerJoin, function (e) { try { onJoin(e.player); } catch (err) { logErr("join: " + err); } });
     Events.on(ET.PlayerLeave, function (e) { try { onLeave(e.player); } catch (err) { } });
     Events.on(ET.BlockBuildEndEvent, function (e) { try { onBuildEnd(e); } catch (err) { logErr("build: " + err); } });
+    // 拆除行为在「刚开始」就要判（Build.beginBreak 记完 ConstructBlock 后触发），不要等拆完
+    Events.on(ET.BlockBuildBeginEvent, function (e) { try { onBuildBegin(e); } catch (err) { logErr("buildBegin: " + err); } });
     Events.on(ET.ConfigEvent, function (e) { try { onConfig(e); } catch (err) { logErr("config: " + err); } });
     Events.on(ET.BlockDestroyEvent, function (e) { try { onBuildDestroy(e); } catch (err) { } });
     Events.on(ET.UnitControlEvent, function (e) { try { if (e.player != null) noteInteract(e.player, "控单位"); } catch (err) { } });
@@ -1504,6 +1622,7 @@ function bindEvents() {
         GTB_VIRUS = {};
         GTB_WATCH = { react: {}, gen: {}, logic: {} };
         GTB_FIRST = {};
+        GTB_BREAK = {};
         GTB_SWEEP.i = 0;
         GTB_SWEEP.rounds = 0;
         GTB.lastScan = 0;

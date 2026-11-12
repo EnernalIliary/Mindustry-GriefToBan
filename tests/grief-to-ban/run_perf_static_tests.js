@@ -254,6 +254,7 @@ var FN_NAMES = [
   "inEditor", "dbg", "dbgFlush", "dbgClear", "flushSettings", "swrite", "selfTestWrite",
   "firstMark", "firstClear", "firstPending", "firstRecent", "tileSnapshot", "restoreTile",
   "firstBreakCheck", "itemSnapshot", "liquidSnapshot", "restoreInventory",
+  "onBuildBegin", "firstBreakBegin", "breakSnapshot", "isConstructBlock", "placeBlock",
   "onJoin", "onLeave", "noteInteract", "punish",
 ];
 for (var fi = 0; fi < FN_NAMES.length; fi++) {
@@ -958,19 +959,19 @@ ok(
   "firstBreakCheck 里缺 Core.app.post( 或 restoreTile(t, snap)（" + fnLabel(F.firstBreakCheck) + "）"
 );
 (function () {
-  var guard = bodyPos(F.restoreTile, "if (t.block() !== air) return false;");
-  var setb = bodyPos(F.restoreTile, "t.setBlock(snap.block, snap.team, snap.rot)");
+  var guard = bodyPos(F.restoreTile, "if (cur !== air");
+  var setb = bodyPos(F.restoreTile, "placeBlock(t, snap)");
   ok(
-    "restoreTile 只在原位是 air 时放回",
+    "restoreTile 只在空位（或允许覆盖的 ConstructBlock）上放回",
     guard >= 0 && setb > guard,
-    "先 if (t.block() !== air) return false; 再 setBlock —— 不许盖掉别人刚铺的方块",
-    "guard 位置=" + guard + "，setBlock 位置=" + setb + "（" + fnLabel(F.restoreTile) + "）"
+    "先 if (cur !== air && !(allowConstruct === true && isConstructBlock(cur))) return false; 再 placeBlock —— 不许盖掉别人刚铺的方块",
+    "guard 位置=" + guard + "，placeBlock 位置=" + setb + "（" + fnLabel(F.restoreTile) + "）"
   );
   ok(
     "restoreTile 还原方块/队伍/朝向/配置",
     setb >= 0 && inBody(F.restoreTile, "nb.configured(null, snap.conf)"),
-    "t.setBlock(snap.block, snap.team, snap.rot) + nb.configured(null, snap.conf)（配置方块连 config 一起还原）",
-    "restoreTile 里缺三参 setBlock 或 configured(null, snap.conf)（" + fnLabel(F.restoreTile) + "）"
+    "placeBlock(t, snap)（三参 block/team/rot）+ nb.configured(null, snap.conf)（配置方块连 config 一起还原）",
+    "restoreTile 里缺 placeBlock(t, snap) 或 configured(null, snap.conf)（" + fnLabel(F.restoreTile) + "）"
   );
 })();
 (function () {
@@ -1120,6 +1121,165 @@ ok(
   UI_SRC.ok
     ? "ui 说明缺「物品与液体」或「多次交互」（" + whereIn(UI_SRC, "behaviorRow") + "）"
     : "读不到 " + UI_SRC.rel + "：" + UI_SRC.err
+);
+
+
+// ================================================================ 9. 拆除刚开始就判 + 原建筑还原
+section("拆除开始就判与还原原方块");
+
+(function () {
+  var need = ["onBuildBegin", "firstBreakBegin", "breakSnapshot", "isConstructBlock", "placeBlock"];
+  var miss = [];
+  for (var i = 0; i < need.length; i++) if (F[need[i]] == null) miss.push(need[i]);
+  ok(
+    "拆除早判 / 还原原方块的新函数都在",
+    miss.length === 0,
+    "onBuildBegin / firstBreakBegin / breakSnapshot / isConstructBlock / placeBlock 五个函数都要在",
+    miss.length ? "缺函数：" + miss.join(", ") : ""
+  );
+})();
+ok(
+  "onBuildBegin 四道早退",
+  F.onBuildBegin != null &&
+    inBody(F.onBuildBegin, "isAuthority()") &&
+    inBody(F.onBuildBegin, "inEditor()") &&
+    inBody(F.onBuildBegin, "e.breaking !== true") &&
+    inBody(F.onBuildBegin, "!cfg0.enable"),
+  "onBuildBegin: 非权威 / 编辑器 / 不是拆除 / 总开关关（或行为关）都直接 return",
+  F.onBuildBegin == null
+    ? "main.js 里没有 function onBuildBegin("
+    : "onBuildBegin 缺 isAuthority() / inEditor() / e.breaking !== true / !cfg0.enable 之一（" + fnLabel(F.onBuildBegin) + "）"
+);
+ok(
+  "onBuildBegin 交给 firstBreakBegin 判",
+  F.onBuildBegin != null && inBody(F.onBuildBegin, "firstBreakBegin(e, p)"),
+  "拆的时候用 e.unit.getPlayer() 拿人，再调 firstBreakBegin(e, p)（判据全在 firstBreakBegin 里）",
+  "onBuildBegin 里找不到 firstBreakBegin(e, p)（" + fnLabel(F.onBuildBegin) + "）"
+);
+ok(
+  "bindEvents 订阅了 BlockBuildBeginEvent",
+  F.bindEvents != null &&
+    inBody(F.bindEvents, "ET.BlockBuildBeginEvent") &&
+    inBody(F.bindEvents, "onBuildBegin(e)"),
+  "Events.on(ET.BlockBuildBeginEvent, ...) → onBuildBegin()（拆除行为在「刚开始」就判，不等拆完）",
+  F.bindEvents == null
+    ? "main.js 里没有 function bindEvents("
+    : "bindEvents 里缺 ET.BlockBuildBeginEvent 或 onBuildBegin(e)（" + fnLabel(F.bindEvents) + "）"
+);
+ok(
+  "firstBreakBegin 要求当前方块是 ConstructBlock",
+  F.firstBreakBegin != null &&
+    inBody(F.firstBreakBegin, "isConstructBlock(cb)") &&
+    inBody(F.firstBreakBegin, "breakSnapshot(t, cb)"),
+  "begin 事件里 tile.build 已经是 ConstructBlock：先 isConstructBlock(cb) 守住，再用 breakSnapshot(t, cb) 取原方块",
+  "firstBreakBegin 里缺 isConstructBlock(cb) 或 breakSnapshot(t, cb)（" + fnLabel(F.firstBreakBegin) + "）"
+);
+(function () {
+  var snap = bodyPos(F.firstBreakBegin, "breakSnapshot(t, cb)");
+  var guard = bodyPos(F.firstBreakBegin, "isConstructBlock(cb)");
+  ok(
+    "firstBreakBegin 先确认 ConstructBlock 再取快照",
+    guard >= 0 && snap > guard,
+    "isConstructBlock(cb) 判断在前，breakSnapshot(t, cb) 在后（不是 ConstructBlock 时不要乱取快照）",
+    "isConstructBlock 位置=" + guard + "，breakSnapshot 位置=" + snap + "（" + fnLabel(F.firstBreakBegin) + "）"
+  );
+})();
+ok(
+  "firstBreakBegin 用 firstBreak 的处罚理由",
+  F.firstBreakBegin != null && inBody(F.firstBreakBegin, "punish(p, LIB.REASON.firstBreak)"),
+  "punish(p, LIB.REASON.firstBreak)（与 End 兜底同一条行为理由，设置里还是同一个开关）",
+  "firstBreakBegin 里没有 punish(p, LIB.REASON.firstBreak)（" + fnLabel(F.firstBreakBegin) + "）"
+);
+(function () {
+  var reg = bodyPos(F.firstBreakBegin, "GTB_BREAK[key] =");
+  var back = bodyPos(F.firstBreakBegin, "restoreTile(t, snap, true)");
+  var del = bodyPos(F.firstBreakBegin, "delete GTB_BREAK[key]");
+  ok(
+    "先登记 GTB_BREAK，再原地撤销拆除",
+    reg >= 0 && back > reg && (del < 0 || del > back),
+    "GTB_BREAK[key] = { snap, name } → restoreTile(t, snap, true)；放回成功后再 delete（失败则留给 End 事件兜底）",
+    "登记位置=" + reg + "，restoreTile 位置=" + back + "，delete 位置=" + del + "（" + fnLabel(F.firstBreakBegin) + "）"
+  );
+})();
+ok(
+  "breakSnapshot 从 ConstructBlock 里取原方块与原建筑",
+  F.breakSnapshot != null &&
+    inBody(F.breakSnapshot, "cb.previous") &&
+    inBody(F.breakSnapshot, "cb.prevBuild") &&
+    inBody(F.breakSnapshot, "get(0)"),
+  "breakSnapshot: block = cb.previous，旧建筑 = cb.prevBuild.get(0)（team / rotation / config() / healthf() / 库存都从旧建筑取）",
+  F.breakSnapshot == null
+    ? "main.js 里没有 function breakSnapshot("
+    : "breakSnapshot 里缺 cb.previous / cb.prevBuild.get(0)（" + fnLabel(F.breakSnapshot) + "）"
+);
+ok(
+  "breakSnapshot 遇到 air 当没取到",
+  F.breakSnapshot != null &&
+    inBody(F.breakSnapshot, "Blocks.air") &&
+    inBody(F.breakSnapshot, "snap.block == null"),
+  "ConstructBlock.previous 默认是 Blocks.air：先把它当 null，再 return null（宁可交给 End 兜底，也不放回一个空壳）",
+  "breakSnapshot 里没有 Blocks.air → null 的守卫（" + fnLabel(F.breakSnapshot) + "）"
+);
+(function () {
+  var cur = bodyPos(F.restoreTile, "isConstructBlock(cur)");
+  var place = bodyPos(F.restoreTile, "placeBlock(t, snap)");
+  ok(
+    "restoreTile 允许覆盖正在拆的 ConstructBlock",
+    cur >= 0 && place > cur && inBody(F.restoreTile, "allowConstruct === true"),
+    "restoreTile(t, snap, allowConstruct)：allowConstruct===true 且当前是 ConstructBlock 时才允许覆盖，其余情况仍只在空位放",
+    "isConstructBlock(cur) 位置=" + cur + "，placeBlock 位置=" + place + "（" + fnLabel(F.restoreTile) + "）"
+  );
+})();
+ok(
+  "placeBlock 联机走 setNet、落不下去退回 setBlock",
+  F.placeBlock != null &&
+    inBody(F.placeBlock, "t.setNet(") &&
+    inBody(F.placeBlock, "t.setBlock(") &&
+    inBody(F.placeBlock, "net.active()"),
+  "placeBlock: net.active() 时 t.setNet(block, team, rot)（Call.setTile 才会同步给客户端），t.block() 没变就退回 t.setBlock(...)",
+  F.placeBlock == null
+    ? "main.js 里没有 function placeBlock("
+    : "placeBlock 里缺 t.setNet( / t.setBlock( / net.active()（" + fnLabel(F.placeBlock) + "）"
+);
+(function () {
+  var con = bodyPos(F.firstBreakCheck, "isConstructBlock(cur)");
+  var snap = bodyPos(F.firstBreakCheck, "tileSnapshot(t)");
+  ok(
+    "firstBreakCheck 遇到 ConstructBlock 不重复处置",
+    con >= 0 && (snap < 0 || con < snap),
+    "firstBreakCheck: 当前是 ConstructBlock 说明拆除中途，交给 GTB_BREAK 那条路，直接 return",
+    "isConstructBlock 位置=" + con + "，tileSnapshot 位置=" + snap + "（" + fnLabel(F.firstBreakCheck) + "）"
+  );
+})();
+(function () {
+  var look = bodyPos(F.onBuildEnd, "GTB_BREAK[");
+  var brk = bodyPos(F.onBuildEnd, "firstBreakCheck(");
+  ok(
+    "onBuildEnd 先查 GTB_BREAK，再走 firstBreakCheck",
+    look >= 0 && brk > look && bodyPos(F.onBuildEnd, "delete GTB_BREAK[kEnd]") >= 0,
+    "breaking 分支：先查 GTB_BREAK[kEnd]（begin 时已判过），有就 Core.app.post 还原再 return；没有才落到 firstBreakCheck",
+    "GTB_BREAK 位置=" + look + "，firstBreakCheck 位置=" + brk + "（" + fnLabel(F.onBuildEnd) + "）"
+  );
+})();
+(function () {
+  var decl = clean.indexOf("var GTB_BREAK = {};");
+  var resets = 0;
+  var at = -1;
+  while ((at = clean.indexOf("GTB_BREAK = {};", at + 1)) >= 0) resets++;
+  ok(
+    "GTB_BREAK 有声明并在换图时重置",
+    decl >= 0 && resets >= 2,
+    "var GTB_BREAK = {}; 声明一处，WorldLoadEvent 回调里再 GTB_BREAK = {};（换图不带着上一张图的记录）",
+    "声明位置=" + decl + "，赋值次数=" + resets
+  );
+})();
+ok(
+  "onBuildBegin 定义在 onBuildEnd 之前",
+  clean.indexOf("function onBuildBegin(") >= 0 &&
+    clean.indexOf("function onBuildBegin(") < clean.indexOf("function onBuildEnd("),
+  "onBuildBegin 放在 onBuildEnd 前面（读代码时先看到「拆的一开始」，再看到「拆完的兜底」）",
+  "onBuildBegin 位置=" + clean.indexOf("function onBuildBegin(") +
+    "，onBuildEnd 位置=" + clean.indexOf("function onBuildEnd(")
 );
 
 // ================================================================ 汇总

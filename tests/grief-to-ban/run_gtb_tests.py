@@ -41,7 +41,7 @@ STAGES = ("check", "lib", "perf", "probe")  # 执行顺序（probe 最慢，放�
 NODE_TESTS = {"lib": LIB_TESTS, "perf": PERF_TESTS}
 NODE_STAGE_DESC = {
     "lib": "纯逻辑层单测（gtb-lib.js）",
-    "perf": "main.js 源码级性能红线（0.1.4）",
+    "perf": "main.js 源码级性能红线（0.1.7）",
 }
 STAGE_DESC = {
     "check": "node --check 每个 GriefToBan/scripts/*.js",
