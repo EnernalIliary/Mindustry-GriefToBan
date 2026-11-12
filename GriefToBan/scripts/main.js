@@ -721,10 +721,73 @@ function firstPending(p) {
     return rec != null && rec.done !== true;
 }
 
-// 拆除事件发生在 tile.remove() 之前 ⇒ 这时候还能读到原方块的种类 / 队伍 / 朝向 / 配置 / 血量
+// 时间窗与「多次交互」共用同一个秒数（cfg.thInteractWindow，默认 10 秒）：
+// 进服后才动手的快速骚扰号才判，进服很久以后拆一块自己的东西不该被算成第一件事。
+function firstRecent(p, winSec) {
+    if (p == null) return false;
+    var rec = GTB_FIRST[uuidOf(p)];
+    if (rec == null || rec.done === true) return false;
+    var win = LIB.toInt(winSec, 0) * 1000;
+    if (win <= 0) return true;
+    return (nowMs() - LIB.toInt(rec.t, 0)) <= win;
+}
+
+// 建筑里装的物品 / 液体：content 表的每一项都问一次，只留数量 > 0 的。
+// 不用 ItemModule.each(LiquidModule.each)：那是 Java 单方法接口，无头环境里传 JS 函数不一定认。
+function itemSnapshot(m) {
+    var out = [];
+    try {
+        var seq = Packages.mindustry.Vars.content.items();
+        if (seq == null) return out;
+        var n = LIB.toInt(seq.size, 0);
+        for (var i = 0; i < n; i++) {
+            var it = seq.get(i);
+            var q = LIB.toInt(m.get(it), 0);
+            if (q > 0) out.push({ item: it, amount: q });
+        }
+    } catch (e) { }
+    return out;
+}
+
+function liquidSnapshot(m) {
+    var out = [];
+    try {
+        var seq = Packages.mindustry.Vars.content.liquids();
+        if (seq == null) return out;
+        var n = LIB.toInt(seq.size, 0);
+        for (var i = 0; i < n; i++) {
+            var lq = seq.get(i);
+            var q = Number(m.get(lq));
+            if (q > 0.0001) out.push({ liquid: lq, amount: q });
+        }
+    } catch (e) { }
+    return out;
+}
+
+function restoreInventory(b, snap) {
+    if (b == null || snap == null) return;
+    try {
+        if (b.items != null && snap.items != null) {
+            try { b.items.clear(); } catch (e0) { }
+            for (var i = 0; i < snap.items.length; i++) {
+                try { b.items.set(snap.items[i].item, snap.items[i].amount); } catch (e1) { }
+            }
+        }
+    } catch (e) { }
+    try {
+        if (b.liquids != null && snap.liquids != null) {
+            try { b.liquids.clear(); } catch (e2) { }
+            for (var j = 0; j < snap.liquids.length; j++) {
+                try { b.liquids.set(snap.liquids[j].liquid, snap.liquids[j].amount); } catch (e3) { }
+            }
+        }
+    } catch (e4) { }
+}
+
+// 拆除事件发生在 tile.remove() 之前 ⇒ 这时候还能读到原方块的种类 / 队伍 / 朝向 / 配置 / 血量 / 库存
 function tileSnapshot(t) {
     if (t == null) return null;
-    var snap = { block: null, team: null, rot: 0, conf: null, hp: 1 };
+    var snap = { block: null, team: null, rot: 0, conf: null, hp: 1, items: null, liquids: null };
     try {
         snap.block = t.block();
         snap.team = t.team();
@@ -733,6 +796,8 @@ function tileSnapshot(t) {
             try { snap.rot = b.rotation; } catch (e1) { }
             try { snap.conf = b.config(); } catch (e2) { }
             try { snap.hp = b.healthf(); } catch (e3) { }
+            try { if (b.items != null) snap.items = itemSnapshot(b.items); } catch (e4) { }
+            try { if (b.liquids != null) snap.liquids = liquidSnapshot(b.liquids); } catch (e5) { }
         }
     } catch (e) { return null; }
     return snap.block == null ? null : snap;
@@ -749,6 +814,7 @@ function restoreTile(t, snap) {
         if (nb != null) {
             try { if (snap.hp < 1) nb.health = snap.block.health * snap.hp; } catch (e1) { }
             if (snap.conf != null) { try { nb.configured(null, snap.conf); } catch (e2) { } }
+            restoreInventory(nb, snap);
         }
         return true;
     } catch (e) { logErr("restore: " + e); return false; }
@@ -758,6 +824,7 @@ function firstBreakCheck(e, p) {
     if (p == null || !firstPending(p)) return;
     var cfg0 = cfg();
     if (!cfg0.enable || !cfg0.bh.firstBreak) { firstClear(p); return; }
+    if (!firstRecent(p, cfg0.thInteractWindow)) { firstClear(p); return; }
     if (isAdmin(p) || targetOf(p) !== "target") { firstClear(p); return; }
     var t = null, snap = null;
     try { t = e.tile; } catch (e1) { t = null; }
@@ -1808,7 +1875,8 @@ function selfTest() {
         chk(watchKind(null) === "" && watchCount() === 0, "watch starts empty");
         chk(typeof watchDrop === "function" && typeof watchAdd === "function", "watch registry helpers");
     chk(typeof firstBreakCheck === "function" && typeof restoreTile === "function" && typeof tileSnapshot === "function", "first-break helpers");
-    chk(firstPending(null) === false, "first-break starts clean");
+    chk(typeof firstRecent === "function" && typeof itemSnapshot === "function" && typeof liquidSnapshot === "function" && typeof restoreInventory === "function", "first-break window / inventory helpers");
+    chk(firstPending(null) === false && firstRecent(null, 10) === false, "first-break starts clean");
     } catch (eQ) { lines.push("FAIL seq: " + eQ); fails.push("seq"); }
     // 黑名单落盘这条路：写进去 → 从 Core.settings 读回 → 再删掉（只在 GTB_SELFTEST 时跑）
     try {

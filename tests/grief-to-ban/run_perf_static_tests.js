@@ -252,7 +252,8 @@ var FN_NAMES = [
   "seedWatch", "sweepWorld", "watchStep",
   "tick", "onBuildEnd", "onConfig", "onBuildDestroy", "bindEvents", "stepLogic",
   "inEditor", "dbg", "dbgFlush", "dbgClear", "flushSettings", "swrite", "selfTestWrite",
-  "firstMark", "firstClear", "firstPending", "tileSnapshot", "restoreTile", "firstBreakCheck",
+  "firstMark", "firstClear", "firstPending", "firstRecent", "tileSnapshot", "restoreTile",
+  "firstBreakCheck", "itemSnapshot", "liquidSnapshot", "restoreInventory",
   "onJoin", "onLeave", "noteInteract", "punish",
 ];
 for (var fi = 0; fi < FN_NAMES.length; fi++) {
@@ -1014,6 +1015,110 @@ ok(
   UI_SRC.ok
     ? "behaviorRow(firstBreak)=" + (/behaviorRow\(\s*c\s*,\s*"firstBreak"/.test(UI_SRC.text) ? "有" : "无") +
       "，七项=" + (UI_SRC.text.indexOf("七项") >= 0 ? "有" : "无") + "（" + whereIn(UI_SRC, "buildBehaviors") + "）"
+    : "读不到 " + UI_SRC.rel + "：" + UI_SRC.err
+);
+
+// ================================================================ 8. 第一动作的时间窗 + 库存还原（0.1.6）
+section("第一动作时间窗与库存还原");
+
+ok(
+  "firstRecent 用 nowMs 与登记时间按秒换算",
+  F.firstRecent != null &&
+    inBody(F.firstRecent, "nowMs()") &&
+    inBody(F.firstRecent, "rec.t") &&
+    inBody(F.firstRecent, "* 1000"),
+  "firstRecent(p, winSec) 里 (nowMs() - rec.t) <= winSec * 1000（时间窗以秒为单位与设置项一致）",
+  F.firstRecent == null
+    ? "main.js 里没有 function firstRecent("
+    : "firstRecent 里缺 nowMs() / rec.t / * 1000（" + fnLabel(F.firstRecent) + "）"
+);
+ok(
+  "firstRecent 先要求还是干净的（done !== true）",
+  F.firstRecent != null && inBody(F.firstRecent, "rec.done === true"),
+  "rec == null || rec.done === true 就返回 false（已经做过别的事的人不进时间窗判定）",
+  "firstRecent 里缺 rec.done === true 的守卫（" + fnLabel(F.firstRecent) + "）"
+);
+(function () {
+  var sw = bodyPos(F.firstBreakCheck, "!cfg0.bh.firstBreak");
+  var rc = bodyPos(F.firstBreakCheck, "firstRecent(p, cfg0.thInteractWindow)");
+  var tl = bodyPos(F.firstBreakCheck, "e.tile");
+  ok(
+    "firstBreakCheck 的时间窗沿用 thInteractWindow",
+    rc >= 0 && rc > sw && (tl < 0 || rc < tl),
+    "开关判断之后、取 e.tile 之前：if (!firstRecent(p, cfg0.thInteractWindow)) { firstClear(p); return; }（不新增设置项）",
+    "开关位置=" + sw + "，时间窗位置=" + rc + "，取 tile 位置=" + tl + "（" + fnLabel(F.firstBreakCheck) + "）"
+  );
+})();
+ok(
+  "时间窗没有自己造新设置键",
+  LIB_SRC.ok && !/first-window|firstWindow|firstWindowSec/.test(LIB_SRC.text) &&
+    /var BH_KEYS = \[[^\]]*"firstBreak"\]/.test(LIB_SRC.text),
+  "gtb-lib.js 里没有 first-window / firstWindow 这类新键；BH_KEYS 仍以 firstBreak 收尾（时间窗复用 thInteractWindow）",
+  LIB_SRC.ok
+    ? "lib 里出现了新的时间窗键（" + whereIn(LIB_SRC, "BH_KEYS") + "）"
+    : "读不到 " + LIB_SRC.rel + "：" + LIB_SRC.err
+);
+(function () {
+  var need = ["itemSnapshot", "liquidSnapshot", "restoreInventory"];
+  var miss = [];
+  for (var i = 0; i < need.length; i++) if (F[need[i]] == null) miss.push(need[i]);
+  ok(
+    "库存快照 / 还原三个函数都在",
+    miss.length === 0,
+    "itemSnapshot / liquidSnapshot / restoreInventory 三个函数都要在（拆除瞬间快照，放回时还原）",
+    miss.length ? "缺函数：" + miss.join(", ") : ""
+  );
+})();
+ok(
+  "itemSnapshot 遍历 content.items()",
+  F.itemSnapshot != null && inBody(F.itemSnapshot, "Packages.mindustry.Vars.content.items()"),
+  "itemSnapshot 用 Packages.mindustry.Vars.content.items() 的 Seq 逐项 get(item)（不依赖 Java 单方法接口回调）",
+  "itemSnapshot 里缺 content.items()（" + fnLabel(F.itemSnapshot) + "）"
+);
+ok(
+  "liquidSnapshot 遍历 content.liquids()",
+  F.liquidSnapshot != null && inBody(F.liquidSnapshot, "Packages.mindustry.Vars.content.liquids()"),
+  "liquidSnapshot 用 Packages.mindustry.Vars.content.liquids() 的 Seq 逐项 get(liquid)",
+  "liquidSnapshot 里缺 content.liquids()（" + fnLabel(F.liquidSnapshot) + "）"
+);
+ok(
+  "tileSnapshot 快照里带 items / liquids 字段",
+  inBody(F.tileSnapshot, "items: null") &&
+    inBody(F.tileSnapshot, "liquids: null") &&
+    inBody(F.tileSnapshot, "itemSnapshot(") &&
+    inBody(F.tileSnapshot, "liquidSnapshot("),
+  "snap = { ..., items: null, liquids: null } 且 b.items != null 时 itemSnapshot(b.items)、b.liquids != null 时 liquidSnapshot(b.liquids)",
+  "tileSnapshot 里缺 items/liquids 初始化或两个快照调用（" + fnLabel(F.tileSnapshot) + "）"
+);
+(function () {
+  var conf = bodyPos(F.restoreTile, "nb.configured(null, snap.conf)");
+  var inv = bodyPos(F.restoreTile, "restoreInventory(nb, snap)");
+  ok(
+    "restoreTile 在 configured 之后还原库存",
+    inv >= 0 && (conf < 0 || inv > conf),
+    "restoreTile: 先 setBlock → 血量 → configured(null, snap.conf) → restoreInventory(nb, snap)",
+    "configured 位置=" + conf + "，restoreInventory 位置=" + inv + "（" + fnLabel(F.restoreTile) + "）"
+  );
+})();
+(function () {
+  var ic = bodyPos(F.restoreInventory, "b.items.clear()");
+  var is = bodyPos(F.restoreInventory, "b.items.set(");
+  var lc = bodyPos(F.restoreInventory, "b.liquids.clear()");
+  var ls = bodyPos(F.restoreInventory, "b.liquids.set(");
+  ok(
+    "restoreInventory 先清空再逐项 set",
+    ic >= 0 && is > ic && lc >= 0 && ls > lc,
+    "items.clear() 早于 items.set(...)，liquids.clear() 早于 liquids.set(...)（放回去的方块里不该留原来残余）",
+    "items.clear=" + ic + " items.set=" + is + " liquids.clear=" + lc + " liquids.set=" + ls +
+      "（" + fnLabel(F.restoreInventory) + "）"
+  );
+})();
+ok(
+  "ui 说明提到库存还原与时间窗",
+  UI_SRC.ok && UI_SRC.text.indexOf("物品与液体") >= 0 && UI_SRC.text.indexOf("多次交互") >= 0,
+  "gtb-ui.js 的 firstBreak 说明要有「物品与液体」与「多次交互」（用户能看到行为边界）",
+  UI_SRC.ok
+    ? "ui 说明缺「物品与液体」或「多次交互」（" + whereIn(UI_SRC, "behaviorRow") + "）"
     : "读不到 " + UI_SRC.rel + "：" + UI_SRC.err
 );
 
