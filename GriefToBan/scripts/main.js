@@ -768,9 +768,8 @@ function punishBuilder(owner, reason, extra) {
     if (msg !== "") broadcast(LIB.textInfo(msg));
 }
 
-// 单个钍堆：由 scanWorld 在唯一那遍遍历里调用（不再自己遍历全图）
-function stepReactor(b, key, live) {
-    live[key] = true;
+// 单个钍堆：由 watchStep 每秒对登记表里调用（不再自己遍历全图）
+function stepReactor(b, key) {
     var cfg0 = cfg();
     {
         var rec = GTB_REACTORS[key];
@@ -828,9 +827,8 @@ function handleBlastGen(b, name, key) {
     return true;
 }
 
-// 单个爆混发电机：同样由 scanWorld 调用
-function stepGen(b, name, key, live) {
-    live[key] = true;
+// 单个爆混发电机：同样由 watchStep 调用
+function stepGen(b, name, key) {
     GTB.stat.gens = GTB.stat.gens + 1;
     var count = itemCount(b, Items.blastCompound);
     var rec = GTB_GENS[key];
@@ -1016,7 +1014,10 @@ function onBuildEnd(e) {
     try { bname = blockNameOf(b); } catch (e3) { bname = ""; }
     // 建造者要记全：钍堆、爆混发电机的处置都得追得到人（原来只记钍堆，所以发电机没人被拉黑）
     var bk = tileKey(e.tile);
-    if (bk !== "" && p != null) {
+    // 登记进监视表（钍堆 / 爆混机 / 逻辑块）。只有这三类会被处置，也只有它们需要记建造者：
+    // 以前所有方块都记，铺线久了表只涨不消，拆掉也不清。
+    var wk = watchAdd(b, bk);
+    if (wk !== "" && bk !== "" && p != null) {
         GTB.builders[bk] = { uuid: uuidOf(p), name: nameOf(p) };
     }
     if (bname === "thorium-reactor") { try { checkReactorNear(b, p); } catch (e4) { } }
@@ -1038,6 +1039,8 @@ function onConfig(e) {
             var b = null;
             try { b = e.tile == null ? null : e.tile.build; } catch (e2) { b = null; }
             if (b != null) {
+                // 配置变化也顺手续上登记（逻辑块改代码 / 发电机被塞爆混）
+                try { watchAdd(b, tileKey(e.tile)); } catch (eW) { }
                 if (isLogicBuild(b)) { try { delete GTB_VIRUS[tileKey(e.tile)]; } catch (e9) { } checkVirus(b, p); }
                 if (blockNameOf(b) === "thorium-reactor") {
                     GTB.builders[tileKey(e.tile)] = { uuid: uuidOf(p), name: nameOf(p) };
@@ -1056,6 +1059,14 @@ function onConfig(e) {
             }
         }
     }
+}
+
+// 方块被拆掉：从监视表、处置记录、建造者表里一并抹掉（表只涨不消会更糟）
+function onBuildDestroy(e) {
+    var t = null;
+    try { t = e.tile; } catch (e1) { return; }
+    if (t == null) return;
+    watchDrop(tileKey(t));
 }
 
 // 游戏默认封禁列表（vanillaBan 打开时以它为准）：每轮扫描缓存一次 uuid 集合
@@ -1080,10 +1091,11 @@ var GTB_VIRUS = {};
 
 function stepLogic(b, key) {
     GTB.stat.logic = GTB.stat.logic + 1;
-    if (GTB_VIRUS[key] === true) return;
     var code = "";
     try { code = b.code == null ? "" : String(b.code); } catch (e3) { return; }
-    if (!isVirusCode(code)) return;
+    // 代码被改干净就把「已处置」标记清掉：否则同一块以后再被注入也不会再报
+    if (!isVirusCode(code)) { if (GTB_VIRUS[key] === true) delete GTB_VIRUS[key]; return; }
+    if (GTB_VIRUS[key] === true) return;
     GTB.stat.virus = GTB.stat.virus + 1;
     var owner = GTB.builders[key];
     var op = owner == null ? null : playerByUuid(owner.uuid);
@@ -1092,9 +1104,19 @@ function stepLogic(b, key) {
     if (owner != null && op == null) addBlacklist(owner.uuid, owner.name, LIB.REASON.virus, true);
 }
 
-// ---- 全图一次遍历：钍堆 + 爆混发电机 + 自复制逻辑，一遍走完 ----
-// 老实现是三个函数各遍历一遍 Groups.build（每遍 size() + 逐元素取值），大图上三倍开销。
-var GTB_PERF = { scan: 0, worst: 0, builds: 0 };
+// ---- 监视表（v0.1.4）：事件增量维护 + 滚动兜底 ----
+// 用户问过「什么东西需要全图扫描」。三处检查（钍堆热量 / 发电机里的爆混 / 自复制逻辑）
+// 盯的是**随时间变化的状态**，原版没有对应事件：ConfigEvent 只在玩家点配置时触发
+// （InputHandler.java:729），物品进出、热量累积、逻辑代码被远程改都不发事件 ——
+// 所以「检查」只能轮询。但「有哪些方块」不该每秒全图找，拆成三层：
+//   ① 世界载入播种一遍（一次性 ~3 ms）；
+//   ② BlockBuildEndEvent / ConfigEvent 登记、BlockDestroyEvent 注销；
+//   ③ 每 tick 滚动看 64 个（≈30 秒扫完 8311 方块，单 tick <0.05 ms），兜住
+//      world processor setblock / 模组直接改世界 / 事件漏发。
+// 结果：每秒真正被检查的方块从全图 8311 降到登记表里的 100~200 个。
+var GTB_WATCH = { react: {}, gen: {}, logic: {} };
+var GTB_SWEEP = { i: 0, per: 64, rounds: 0 };
+var GTB_PERF = { scan: 0, worst: 0, builds: 0, sweep: 0, sweepWorst: 0, watch: 0 };
 var GTB_PUNISH = { n: 0, max: 6 };
 
 function nowNanos() {
@@ -1105,39 +1127,148 @@ function tileKeyOf(b, i) {
     try { return b.tile.x + "," + b.tile.y; } catch (e) { return "?" + i; }
 }
 
-function scanWorld(now) {
-    GTB_PUNISH.n = 0;
-    var cfg0 = cfg();
-    if (!cfg0.enable) return 0;
+// 这个方块归哪张表（react/gen/logic），不是我们要盯的就返回 ""
+function watchKind(b) {
+    if (b == null) return "";
+    var name = "";
+    try { name = blockNameOf(b); } catch (e) { return ""; }
+    if (name === "thorium-reactor") return "react";
+    if (isBlastGenName(name)) return "gen";
+    try { if (isLogicBuild(b)) return "logic"; } catch (e2) { }
+    return "";
+}
+
+function watchAdd(b, key) {
+    var kind = watchKind(b);
+    if (kind === "") return "";
+    if (key == null || key === "") key = tileKeyOf(b, 0);
+    if (key === "" || key.charAt(0) === "?") return "";
+    GTB_WATCH[kind][key] = b;
+    return kind;
+}
+
+function watchDrop(key) {
+    if (key == null || key === "") return;
+    delete GTB_WATCH.react[key];
+    delete GTB_WATCH.gen[key];
+    delete GTB_WATCH.logic[key];
+    delete GTB_REACTORS[key];
+    delete GTB_GENS[key];
+    delete GTB_VIRUS[key];
+    delete GTB.builders[key];
+}
+
+function watchSize(tbl) {
+    var n = 0, k;
+    if (tbl == null) return 0;
+    for (k in tbl) if (tbl.hasOwnProperty(k)) n++;
+    return n;
+}
+
+function watchCount() {
+    var n = 0, k;
+    for (k in GTB_WATCH.react) if (GTB_WATCH.react.hasOwnProperty(k)) n++;
+    for (k in GTB_WATCH.gen) if (GTB_WATCH.gen.hasOwnProperty(k)) n++;
+    for (k in GTB_WATCH.logic) if (GTB_WATCH.logic.hasOwnProperty(k)) n++;
+    return n;
+}
+
+// 登记表里的方块可能已经被拆掉（事件漏了 / 换了图）：这里顺手验证并清掉
+function watchLive(ref, key) {
+    if (ref == null) { watchDrop(key); return null; }
+    var ok = false;
+    try { ok = ref.isValid() === true; } catch (e) { ok = false; }
+    if (!ok) { watchDrop(key); return null; }
+    return ref;
+}
+
+// 世界载入：整图播种一遍，之后全靠事件 + 滚动兜底
+function seedWatch() {
+    GTB_WATCH = { react: {}, gen: {}, logic: {} };
+    GTB_SWEEP.i = 0;
+    GTB_SWEEP.rounds = 0;
     var arr = null;
     try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return 0; }
     var n = seqSize(arr);
-    GTB_PERF.builds = n;
-    var wantR = cfg0.bh.reactorBoom === true;
-    var wantG = cfg0.bh.blastGen === true;
-    var wantV = cfg0.bh.virus === true;
-    GTB.stat = { reactors: 0, hot: 0, logic: 0, virus: 0, gens: 0 };
-    if (!wantR && !wantG && !wantV) return n;
-    var liveR = {}, liveG = {};
-    var t0 = nowNanos();
     for (var i = 0; i < n; i++) {
         var b = null;
         try { b = arr.index(i); } catch (e2) { continue; }
         if (b == null) continue;
-        var name = "";
-        try { name = blockNameOf(b); } catch (e3) { name = ""; }
-        if (wantR && name === "thorium-reactor") { stepReactor(b, tileKeyOf(b, i), liveR); continue; }
-        if (wantG && isBlastGenName(name)) { stepGen(b, name, tileKeyOf(b, i), liveG); continue; }
-        if (wantV && isLogicBuild(b)) { stepLogic(b, tileKeyOf(b, i)); }
+        try { watchAdd(b, tileKeyOf(b, i)); } catch (e3) { }
     }
-    // 方块没了就忘掉记录，别让表一直变长
-    if (wantR) { for (var k in GTB_REACTORS) { if (GTB_REACTORS.hasOwnProperty(k) && liveR[k] !== true) delete GTB_REACTORS[k]; } }
-    if (wantG) { for (var k2 in GTB_GENS) { if (GTB_GENS.hasOwnProperty(k2) && liveG[k2] !== true) delete GTB_GENS[k2]; } }
+    return n;
+}
+
+// 每 tick 64 个方块：不算什么，约 30 秒（8311 方块）滚一遍全图
+function sweepWorld() {
+    var arr = null;
+    try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return; }
+    var n = seqSize(arr);
+    GTB_PERF.builds = n;
+    if (n <= 0) return;
+    if (GTB_SWEEP.i >= n) { GTB_SWEEP.i = 0; GTB_SWEEP.rounds = GTB_SWEEP.rounds + 1; }
+    var t0 = nowNanos();
+    var end = GTB_SWEEP.i + GTB_SWEEP.per;
+    if (end > n) end = n;
+    for (var i = GTB_SWEEP.i; i < end; i++) {
+        var b = null;
+        try { b = arr.index(i); } catch (e2) { continue; }
+        if (b == null) continue;
+        try { watchAdd(b, tileKeyOf(b, i)); } catch (e3) { }
+    }
+    GTB_SWEEP.i = end >= n ? 0 : end;
+    var ms = (nowNanos() - t0) / 1000000;
+    GTB_PERF.sweep = ms;
+    if (ms > GTB_PERF.sweepWorst) GTB_PERF.sweepWorst = ms;
+}
+
+// 每秒只检查登记表里的方块（热量、爆混、逻辑代码都是会变的状态）
+function watchStep(now) {
+    GTB_PUNISH.n = 0;
+    var cfg0 = cfg();
+    GTB.stat = { reactors: 0, hot: 0, logic: 0, virus: 0, gens: 0 };
+    var wantR = cfg0.enable && cfg0.bh.reactorBoom === true;
+    var wantG = cfg0.enable && cfg0.bh.blastGen === true;
+    var wantV = cfg0.enable && cfg0.bh.virus === true;
+    var t0 = nowNanos();
+    var key, b, gname;
+    if (wantR) {
+        for (key in GTB_WATCH.react) {
+            if (!GTB_WATCH.react.hasOwnProperty(key)) continue;
+            b = watchLive(GTB_WATCH.react[key], key);
+            if (b == null) continue;
+            try { stepReactor(b, key); } catch (e1) { logErr("react: " + e1); }
+        }
+    }
+    if (wantG) {
+        for (key in GTB_WATCH.gen) {
+            if (!GTB_WATCH.gen.hasOwnProperty(key)) continue;
+            b = watchLive(GTB_WATCH.gen[key], key);
+            if (b == null) continue;
+            gname = "";
+            try { gname = blockNameOf(b); } catch (e2) { gname = ""; }
+            try { stepGen(b, gname, key); } catch (e3) { logErr("gen: " + e3); }
+        }
+    }
+    if (wantV) {
+        for (key in GTB_WATCH.logic) {
+            if (!GTB_WATCH.logic.hasOwnProperty(key)) continue;
+            b = watchLive(GTB_WATCH.logic[key], key);
+            if (b == null) continue;
+            try { stepLogic(b, key); } catch (e4) { logErr("logic: " + e4); }
+        }
+    }
+    // 计数取「登记表里的方块数」而不是这一轮碰到的次数：世界里有几台钍堆 / 几台发电机
+    // 是稳定值，不该因为某一秒刚好把开关关掉就显示 0（hot / virus 是此刻状态，仍按这一轮算）
+    GTB.stat.reactors = watchSize(GTB_WATCH.react);
+    GTB.stat.gens = watchSize(GTB_WATCH.gen);
+    GTB.stat.logic = watchSize(GTB_WATCH.logic);
     var ms = (nowNanos() - t0) / 1000000;
     GTB_PERF.scan = ms;
+    GTB_PERF.watch = watchCount();
     if (ms > GTB_PERF.worst) GTB_PERF.worst = ms;
-    if (ms >= 40) dbg("scan slow " + Math.round(ms) + "ms builds=" + n + " react=" + GTB.stat.reactors + " logic=" + GTB.stat.logic);
-    return n;
+    if (ms >= 40) dbg("watch slow " + Math.round(ms) + "ms watched=" + GTB_PERF.watch + " builds=" + GTB_PERF.builds);
+    return GTB_PERF.watch;
 }
 
 function tick() {
@@ -1151,6 +1282,8 @@ function tick() {
     // 地图编辑器（单人沙盒）：整套防 grief 逻辑一行都不跑 —— 见 inEditor() 的注释。
     // 注意放在落盘之后：编辑器里改设置也得存得住，只是不扫世界。
     if (inEditor()) return;
+    // 滚动兜底：每 tick 只登记 64 个方块，几乎不占时间（见 sweepWorld 注释）
+    try { sweepWorld(); } catch (eS) { logErr("sweep: " + eS); }
     try { tickVote(); } catch (e) { logErr("vote: " + e); }
     try { tickAdmins(); } catch (e2) { logErr("admins: " + e2); }
     try { tickAfk(now); } catch (e3) { logErr("afk: " + e3); }
@@ -1158,11 +1291,12 @@ function tick() {
     if (now - GTB.lastScan >= 1000) {
         GTB.lastScan = now;
         try { refreshVanBan(); } catch (e7) { }
-        try { scanWorld(now); } catch (e4) { logErr("scan: " + e4); }
+        try { watchStep(now); } catch (e4) { logErr("watch: " + e4); }
         try {
-            expose("gtb.scan", "builds=" + GTB_PERF.builds + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
+            expose("gtb.scan", "builds=" + GTB_PERF.builds + " watch=" + GTB_PERF.watch + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
                 + " logic=" + GTB.stat.logic + " virus=" + GTB.stat.virus + " gens=" + GTB.stat.gens
                 + " ms=" + Math.round(GTB_PERF.scan) + " worst=" + Math.round(GTB_PERF.worst)
+                + " sweep=" + Math.round(GTB_PERF.sweepWorst * 1000) / 1000
                 + " reactBoom=" + (cfg().bh.reactorBoom ? 1 : 0) + " virusOn=" + (cfg().bh.virus ? 1 : 0));
         } catch (eX) { }
         if (now - GTB_DBG.lastBeat >= 10000) {
@@ -1172,6 +1306,7 @@ function tick() {
                 + " builds=" + GTB_PERF.builds + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
                 + " logic=" + GTB.stat.logic + " virus=" + GTB.stat.virus
                 + " scan=" + Math.round(GTB_PERF.scan) + "ms worst=" + Math.round(GTB_PERF.worst) + "ms"
+                + " watch=" + GTB_PERF.watch + " sweep=" + Math.round(GTB_PERF.sweepWorst * 1000) / 1000 + "ms"
                 + " list=" + c.blacklist.length + " watch=" + c.watch.length
                 + " editor=" + (inEditor() ? 1 : 0));
             dbgFlush();
@@ -1200,6 +1335,7 @@ function bindEvents() {
     Events.on(ET.PlayerLeave, function (e) { try { onLeave(e.player); } catch (err) { } });
     Events.on(ET.BlockBuildEndEvent, function (e) { try { onBuildEnd(e); } catch (err) { logErr("build: " + err); } });
     Events.on(ET.ConfigEvent, function (e) { try { onConfig(e); } catch (err) { logErr("config: " + err); } });
+    Events.on(ET.BlockDestroyEvent, function (e) { try { onBuildDestroy(e); } catch (err) { } });
     Events.on(ET.UnitControlEvent, function (e) { try { if (e.player != null) noteInteract(e.player, "控单位"); } catch (err) { } });
     Events.on(ET.BuildingCommandEvent, function (e) { try { if (e.player != null) noteInteract(e.player, "指挥方块"); } catch (err) { } });
     Events.run(ET.Trigger.update, function () { try { tick(); } catch (err) { } });
@@ -1210,10 +1346,17 @@ function bindEvents() {
         GTB_REACTORS = {};
         GTB_GENS = {};
         GTB_VIRUS = {};
+        GTB_WATCH = { react: {}, gen: {}, logic: {} };
+        GTB_SWEEP.i = 0;
+        GTB_SWEEP.rounds = 0;
         GTB.lastScan = 0;
         GTB.lastTick = 0;
+        // 全图只在这里过一遍（一次性播种）：此后靠建造/拆除事件 + 每 tick 64 个的滚动兜底
+        var seeded = 0;
+        try { seeded = seedWatch(); } catch (eS2) { seeded = 0; }
         try { reload(); } catch (e) { }
-        dbg("world loaded " + authInfo() + (inEditor() ? " editor=1（编辑器里本模组不工作）" : ""));
+        dbg("world loaded " + authInfo() + " builds=" + seeded + " watch=" + watchCount()
+            + (inEditor() ? " editor=1（编辑器里本模组不工作）" : ""));
         try { dbgFlush(); } catch (e5) { }
         try { flushSettings(nowMs()); } catch (e6) { }
     });
@@ -1570,7 +1713,10 @@ function selfTest() {
         chk(seqSize(gb) >= 0, "seq size");
         chk(seqGet(gb, 0) !== undefined, "seq get/index");
         chk(seqGet({ index: function (i) { return i === 0 ? "x" : null; } }, 0) === "x", "seqGet 先走 index()（EntityGroup 没有 get）");
-        chk(typeof scanWorld === "function" && typeof inEditor === "function" && typeof flushSettings === "function", "perf/editor helpers");
+        chk(typeof watchStep === "function" && typeof sweepWorld === "function" && typeof seedWatch === "function"
+            && typeof inEditor === "function" && typeof flushSettings === "function", "perf/editor helpers");
+        chk(watchKind(null) === "" && watchCount() === 0, "watch starts empty");
+        chk(typeof watchDrop === "function" && typeof watchAdd === "function", "watch registry helpers");
     } catch (eQ) { lines.push("FAIL seq: " + eQ); fails.push("seq"); }
     // 黑名单落盘这条路：写进去 → 从 Core.settings 读回 → 再删掉（只在 GTB_SELFTEST 时跑）
     try {

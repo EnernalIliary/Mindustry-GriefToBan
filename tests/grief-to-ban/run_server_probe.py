@@ -39,7 +39,7 @@ GRACE_S = 3.0       # 看到 selftest OK/FAIL 后再收 3 秒日志
 KILL_WAIT_S = 10.0
 
 # 判定用标记（只匹配 ASCII 片段，绕开中文编码差异；完整中文行另外打印）
-LOAD_MARK = "Grief to Ban v0.1.3"
+LOAD_MARK = "Grief to Ban v0.1.4"
 LOAD_MARK_CN = "已加载"
 SELFTEST_OK = "selftest OK"
 SELFTEST_FAIL = "selftest FAIL"

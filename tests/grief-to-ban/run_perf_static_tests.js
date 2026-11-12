@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 "use strict";
 
-// GriefToBan . main.js 源码级红线（0.1.3 性能回归）
+// GriefToBan . main.js 源码级红线（0.1.4 事件驱动架构）
 //
-// 背景（用户 2026-11-12 报「启用 Grief to Ban 后进地图编辑器加载很久、长时间未响应」）：
+// 背景（用户 2026-11-12 报「启用 Grief to Ban 后进地图编辑器加载很久、长时间未响应」，随后又嫌「每秒全图扫描」）：
 //   1) seqGet() 老写法先试 seq.get(i)，但 v160 的 mindustry.entities.EntityGroup 没有 get(int)
 //      （EntityGroup.java:231/235 只有 index(int)/size()）⇒ 每个方块抛一次 TypeError 再被 catch，
-//      大图 8311 方块 × 每秒 3 遍扫描 ≈ 每秒 2.5 万次异常。
-//   2) scanReactors / scanGenerators / scanVirusQuick 三遍全图扫描，合并成一遍 scanWorld。
-//   3) 地图编辑器（Rules.editor）里整套逻辑不该跑。
+//      大图 8311 方块 × 每秒多遍扫描 ≈ 每秒上万次异常。seqGet 必须先走 index(i)，循环里直接 arr.index(i)。
+//   2) v0.1.3 曾把三遍全图扫描合并成「每秒一遍」的 scanWorld；v0.1.4 进一步换成三层结构：
+//      ① 世界载入 seedWatch() 一次性播种；
+//      ② 事件增量：onBuildEnd / onConfig 里 watchAdd()，BlockDestroyEvent → onBuildDestroy() → watchDrop()；
+//      ③ 每 tick sweepWorld() 只登记 GTB_SWEEP.per = 64 个方块（滚动兜底），
+//         每秒 watchStep(now) 只遍历 GTB_WATCH.react / .gen / .logic 三张登记表。
+//      scanWorld() 应已整个删除；watchStep() 里一次 Groups.build 都不许有（那就是又回到全图）。
+//   3) 地图编辑器（Rules.editor，Rules.java:51）里整套逻辑不跑：tick / onBuildEnd / onConfig 开头早退。
 //   4) 名单每次变更就 autosave settings.bin ⇒ 主线程磁盘 I/O；改成脏标记 + tick 里节流落盘。
 //   5) 一轮最多处置 GTB_PUNISH.max 个建造者，防一次性几十次 autosave/广播。
 //   6) dbg() 每行一次 open/append/close ⇒ 改成内存缓冲 + dbgFlush() 批量落盘。
@@ -17,6 +22,7 @@
 // 零依赖；不改 GriefToBan/ 下任何文件。
 // 运行：node tests/grief-to-ban/run_perf_static_tests.js
 // 全绿：打印 "GTB perf static: N passed" 并 exit 0；失败：打印期望/实际（含行号）+ exit 1。
+// GTB_MAIN_JS=/path/to/main.js 可指向副本（只为验证红线真的会红）。
 
 var path = require("path");
 var fs = require("fs");
@@ -140,6 +146,44 @@ function findFunction(text, name) {
   return null;
 }
 
+// 从 startIdx 之后第一个 "{" 开始做花括号配对（用于取匿名回调体，如 WorldLoadEvent 的 function () {...}）。
+function blockAt(text, startIdx) {
+  var braceStart = text.indexOf("{", startIdx);
+  if (braceStart < 0) return null;
+  var depth = 0;
+  var quote = "";
+  for (var i = braceStart; i < text.length; i++) {
+    var c = text.charAt(i);
+    if (quote) {
+      if (c === "\\") { i++; continue; }
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        return {
+          body: text.slice(braceStart, i + 1),
+          startLine: lineAt(text, braceStart),
+          endLine: lineAt(text, i),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// "var NAME = { ... };" 的声明体（用于检查常量表字段是否被偷偷改小）。
+function declaration(text, name) {
+  var at = text.indexOf("var " + name + " = {");
+  if (at < 0) return null;
+  var end = text.indexOf("};", at);
+  if (end < 0) return null;
+  return { body: text.slice(at, end + 2), index: at };
+}
+
 function occurrences(text, needle) {
   var out = [];
   var at = text.indexOf(needle);
@@ -162,6 +206,10 @@ function fnLabel(fn) {
   return fn == null ? "(函数不存在)" : MAIN_REL + ":" + fn.startLine + "-" + fn.endLine;
 }
 
+function bodyWhere(fn, offset) {
+  return fn == null ? "未出现" : where(clean, clean.indexOf(fn.body) + offset);
+}
+
 var src = "";
 try {
   src = fs.readFileSync(MAIN_FILE, "utf8");
@@ -175,7 +223,10 @@ var clean = stripComments(src);
 
 var F = {};
 var FN_NAMES = [
-  "seqGet", "seqIter", "seqEach", "scanWorld", "tick", "onBuildEnd", "onConfig",
+  "seqGet", "seqIter", "seqEach",
+  "watchKind", "watchAdd", "watchDrop", "watchCount", "watchLive",
+  "seedWatch", "sweepWorld", "watchStep",
+  "tick", "onBuildEnd", "onConfig", "onBuildDestroy", "bindEvents", "stepLogic",
   "inEditor", "dbg", "dbgFlush", "dbgClear", "flushSettings", "swrite", "selfTestWrite",
 ];
 for (var fi = 0; fi < FN_NAMES.length; fi++) {
@@ -213,82 +264,362 @@ ok(
   F.seqIter == null ? "没找到 function seqIter(" : "seqIter 体：" + F.seqIter.body.replace(/\s+/g, " ").slice(0, 160)
 );
 
-// ================================================================ 2. 单遍 scanWorld
-section("单遍 scanWorld");
-ok(
-  "scanWorld 存在",
-  F.scanWorld != null,
-  "三遍全图扫描应合并成一遍 scanWorld(now)",
-  F.scanWorld == null ? "没找到 function scanWorld(" : fnLabel(F.scanWorld)
-);
-var LEGACY = ["scanReactors", "scanGenerators", "scanVirusQuick"];
-var legacyHits = [];
-for (var li = 0; li < LEGACY.length; li++) {
-  var ln = LEGACY[li];
-  var occ = occurrences(clean, ln);
-  if (occ.length) legacyHits.push(ln + "(" + occ.length + " 处，首个 " + where(clean, occ[0]) + ")");
-}
-ok(
-  "旧的三遍扫描函数已不存在",
-  legacyHits.length === 0,
-  "scanReactors / scanGenerators / scanVirusQuick 全部删除（含定义与调用），只剩 scanWorld",
-  legacyHits.length === 0 ? "已全部消失" : "仍存在：" + legacyHits.join("；")
-);
-ok(
-  "scanWorld 里只取一次 Groups.build",
-  occurrences(F.scanWorld ? F.scanWorld.body : "", "Packages.mindustry.gen.Groups.build").length === 1,
-  "一遍遍历：Groups.build 只取一次，之后 逐方块分派 stepReactor/stepGen/stepLogic",
-  "出现次数=" + occurrences(F.scanWorld ? F.scanWorld.body : "", "Packages.mindustry.gen.Groups.build").length + "（" + fnLabel(F.scanWorld) + "）"
-);
-var DISPATCH = [
-  ["stepReactor(", "钍堆"],
-  ["stepGen(", "爆混发电机"],
-  ["stepLogic(", "自复制逻辑"],
-];
-for (var di = 0; di < DISPATCH.length; di++) {
-  var dname = DISPATCH[di][0];
+// ================================================================ 2. 事件驱动 + 滚动兜底（v0.1.4）
+// 用户嫌「每秒全图扫描」：现在只有世界载入那一次全图（seedWatch），平时靠建造/配置/拆除事件
+// 增量维护登记表，再每 tick 滚动登记 64 个兜底；每秒只遍历登记表里的 100~200 个方块。
+section("事件驱动 + 滚动兜底");
+
+// --- 2.0 scanWorld 彻底消失（含注释：留着注释容易被下一个人当成还能用的入口）
+(function () {
+  var hits = occurrences(src, "scanWorld");
   ok(
-    "scanWorld 分派到 " + dname,
-    inBody(F.scanWorld, dname),
-    "同一遍遍历里按方块类型分派到 " + dname + "（" + DISPATCH[di][1] + "）",
-    "scanWorld 函数体里找不到 " + dname + "（" + fnLabel(F.scanWorld) + "）"
+    "scanWorld 已彻底删除",
+    hits.length === 0,
+    "v0.1.4 不该再有 scanWorld（连注释都不留）：全图遍历换成 seedWatch 一次 + sweepWorld 每 tick 64 个 + watchStep 只走登记表",
+    hits.length === 0 ? "0 处" : "仍有 " + hits.length + " 处，首个 " + where(src, hits[0])
+  );
+})();
+
+// --- 2.1 三层结构的三张表
+var WATCH_DECL = declaration(clean, "GTB_WATCH");
+ok(
+  "GTB_WATCH 是三张登记表",
+  WATCH_DECL != null &&
+    /react:\s*\{\}/.test(WATCH_DECL.body) &&
+    /gen:\s*\{\}/.test(WATCH_DECL.body) &&
+    /logic:\s*\{\}/.test(WATCH_DECL.body),
+  "var GTB_WATCH = { react: {}, gen: {}, logic: {} }（钍堆 / 爆混发电机 / 逻辑块）",
+  WATCH_DECL == null ? "没找到 var GTB_WATCH = {" : WATCH_DECL.body.replace(/\s+/g, " ")
+);
+var SWEEP_DECL = declaration(clean, "GTB_SWEEP");
+ok(
+  "GTB_SWEEP 每 tick 只走 64 个",
+  SWEEP_DECL != null &&
+    /i:\s*0/.test(SWEEP_DECL.body) &&
+    /per:\s*64/.test(SWEEP_DECL.body) &&
+    /rounds:\s*0/.test(SWEEP_DECL.body),
+  "var GTB_SWEEP = { i: 0, per: 64, rounds: 0 }（滚动兜底的游标/步长）",
+  SWEEP_DECL == null ? "没找到 var GTB_SWEEP = {" : SWEEP_DECL.body.replace(/\s+/g, " ")
+);
+var PERF_DECL = declaration(clean, "GTB_PERF");
+ok(
+  "GTB_PERF 记录 sweep/watch 指标",
+  PERF_DECL != null &&
+    /scan:/.test(PERF_DECL.body) &&
+    /worst:/.test(PERF_DECL.body) &&
+    /builds:/.test(PERF_DECL.body) &&
+    /sweep:/.test(PERF_DECL.body) &&
+    /sweepWorst:/.test(PERF_DECL.body) &&
+    /watch:/.test(PERF_DECL.body),
+  "var GTB_PERF = { scan, worst, builds, sweep, sweepWorst, watch }（心跳里看每轮真实开销与登记表大小）",
+  PERF_DECL == null ? "没找到 var GTB_PERF = {" : PERF_DECL.body.replace(/\s+/g, " ")
+);
+
+// --- 2.2 watchStep：每秒只遍历登记表，不许碰 Groups.build
+ok(
+  "watchStep 存在",
+  F.watchStep != null,
+  "每秒只检查登记表：function watchStep(now)",
+  F.watchStep == null ? "没找到 function watchStep(" : fnLabel(F.watchStep)
+);
+(function () {
+  var hits = occurrences(F.watchStep ? F.watchStep.body : "", "Groups.build");
+  ok(
+    "watchStep 里没有 Groups.build",
+    F.watchStep != null && hits.length === 0,
+    "每秒检查绝不能全图：watchStep 只遍历 GTB_WATCH.react / .gen / .logic，一次 Groups.build 都不许出现",
+    F.watchStep == null
+      ? "(函数不存在)"
+      : hits.length === 0
+        ? "0 次"
+        : "出现 " + hits.length + " 次，首个 " + bodyWhere(F.watchStep, hits[0])
+  );
+})();
+var WATCH_TABLES = [
+  ["react", "钍堆"],
+  ["gen", "爆混发电机"],
+  ["logic", "自复制逻辑"],
+];
+for (var wi = 0; wi < WATCH_TABLES.length; wi++) {
+  var kind = WATCH_TABLES[wi][0];
+  var kindDesc = WATCH_TABLES[wi][1];
+  var forIn = new RegExp("for\\s*\\(\\s*\\w+\\s+in\\s+GTB_WATCH\\." + kind + "\\s*\\)");
+  ok(
+    "watchStep 遍历 GTB_WATCH." + kind + "（" + kindDesc + "）",
+    F.watchStep != null && forIn.test(F.watchStep.body),
+    "watchStep 里 for (key in GTB_WATCH." + kind + ") —— 每秒只走这一张表（" + kindDesc + "）",
+    F.watchStep == null ? "(函数不存在)" : "没找到 for (… in GTB_WATCH." + kind + ")（" + fnLabel(F.watchStep) + "）"
   );
 }
 ok(
-  "scanWorld 循环里用 arr.index(i)",
-  inBody(F.scanWorld, "arr.index(i)") && !inBody(F.scanWorld, "seqGet("),
-  "热循环直接 arr.index(i)，不经 seqGet 的多级 try（否则仍有一次 get 异常）",
-  "arr.index(i)=" + inBody(F.scanWorld, "arr.index(i)") + "，seqGet= " + inBody(F.scanWorld, "seqGet(") + "（" + fnLabel(F.scanWorld) + "）"
+  "watchStep 用 watchLive 校验登记项",
+  inBody(F.watchStep, "watchLive("),
+  "遍历登记表时先 watchLive(ref, key)（isValid() 为假就 watchDrop），避免对已拆方块空转",
+  "watchStep 里没调 watchLive(（" + fnLabel(F.watchStep) + "）"
+);
+var STEP_CALLS = [
+  ["stepReactor(", "钍堆热量"],
+  ["stepGen(", "爆混发电机"],
+  ["stepLogic(", "自复制逻辑"],
+];
+for (var si = 0; si < STEP_CALLS.length; si++) {
+  var stepName = STEP_CALLS[si][0];
+  ok(
+    "watchStep 调 " + stepName,
+    inBody(F.watchStep, stepName),
+    "登记表里的" + STEP_CALLS[si][1] + "由 watchStep 每秒调 " + stepName + " 检查",
+    "watchStep 里找不到 " + stepName + "（" + fnLabel(F.watchStep) + "）"
+  );
+}
+ok(
+  "watchStep 记录 GTB_PERF.scan / worst / watch",
+  inBody(F.watchStep, "GTB_PERF.scan") &&
+    inBody(F.watchStep, "GTB_PERF.worst") &&
+    inBody(F.watchStep, "GTB_PERF.watch"),
+  "watchStep 用 nowNanos() 记 GTB_PERF.scan / worst，并刷新 GTB_PERF.watch = watchCount()（心跳里能看出登记表多大）",
+  "GTB_PERF.scan=" + inBody(F.watchStep, "GTB_PERF.scan") +
+    "，GTB_PERF.worst=" + inBody(F.watchStep, "GTB_PERF.worst") +
+    "，GTB_PERF.watch=" + inBody(F.watchStep, "GTB_PERF.watch")
+);
+
+// --- 2.3 sweepWorld：每 tick 只滚动登记 64 个
+ok(
+  "sweepWorld 存在",
+  F.sweepWorld != null,
+  "滚动兜底：function sweepWorld()（每 tick 只登记 GTB_SWEEP.per 个方块）",
+  F.sweepWorld == null ? "没找到 function sweepWorld(" : fnLabel(F.sweepWorld)
+);
+(function () {
+  var hits = occurrences(F.sweepWorld ? F.sweepWorld.body : "", "Packages.mindustry.gen.Groups.build");
+  ok(
+    "sweepWorld 里只取一次 Groups.build",
+    F.sweepWorld != null && hits.length === 1,
+    "滚动兜底每 tick 取一次 Groups.build，只看 GTB_SWEEP.i 起的 64 个（不是整张表都遍历）",
+    F.sweepWorld == null
+      ? "(函数不存在)"
+      : "出现 " + hits.length + " 次" + (hits.length ? "，首个 " + bodyWhere(F.sweepWorld, hits[0]) : "")
+  );
+})();
+ok(
+  "sweepWorld 用 GTB_SWEEP.per 限量",
+  inBody(F.sweepWorld, "GTB_SWEEP.per"),
+  "步长来自 GTB_SWEEP.per（= 64），别写成硬编码大数或一次扫完",
+  "sweepWorld 里没引用 GTB_SWEEP.per（" + fnLabel(F.sweepWorld) + "）"
 );
 ok(
-  "tick 里调用 scanWorld(",
-  inBody(F.tick, "scanWorld("),
-  "tick 的每秒扫描调用 scanWorld(now)",
-  "tick 函数体里找不到 scanWorld(（" + fnLabel(F.tick) + "）"
+  "sweepWorld 滚动推进 GTB_SWEEP.i",
+  inBody(F.sweepWorld, "GTB_SWEEP.i = end") && inBody(F.sweepWorld, "GTB_SWEEP.i >= n"),
+  "游标推进 GTB_SWEEP.i = end >= n ? 0 : end，并在 GTB_SWEEP.i >= n 时回到 0（÷ 轮次计数）",
+  "GTB_SWEEP.i = end 或 GTB_SWEEP.i >= n 缺失（" + fnLabel(F.sweepWorld) + "）"
 );
 ok(
-  "tick 每秒一轮扫描",
-  inBody(F.tick, "now - GTB.lastScan >= 1000"),
-  "扫描节奏 1000ms（钍堆升温到炸只有几秒，不能退到 3 秒）",
-  "tick 里找不到 \"now - GTB.lastScan >= 1000\"（" + fnLabel(F.tick) + "）"
+  "sweepWorld 记录 GTB_PERF.sweep / sweepWorst",
+  inBody(F.sweepWorld, "GTB_PERF.sweep") && inBody(F.sweepWorld, "GTB_PERF.sweepWorst"),
+  "sweepWorld 记 GTB_PERF.sweep 与 sweepWorst（单 tick 兜底开销应 < 0.05ms）",
+  "GTB_PERF.sweep=" + inBody(F.sweepWorld, "GTB_PERF.sweep") +
+    "，sweepWorst=" + inBody(F.sweepWorld, "GTB_PERF.sweepWorst")
+);
+
+// --- 2.4 seedWatch：世界载入一次性播种
+ok(
+  "seedWatch 存在",
+  F.seedWatch != null,
+  "世界载入播种：function seedWatch()（全图只在这次过一遍）",
+  F.seedWatch == null ? "没找到 function seedWatch(" : fnLabel(F.seedWatch)
 );
 ok(
-  "GTB_PERF 记录 scan/worst",
-  /var\s+GTB_PERF\s*=\s*\{\s*scan:\s*0,\s*worst:\s*0,\s*builds:\s*0\s*\}/.test(clean),
-  "var GTB_PERF = { scan: 0, worst: 0, builds: 0 }",
-  "没找到 GTB_PERF 的三个字段定义"
+  "seedWatch 里读 Groups.build",
+  inBody(F.seedWatch, "Packages.mindustry.gen.Groups.build"),
+  "seedWatch 需要一次全图播种：arr = Packages.mindustry.gen.Groups.build",
+  "seedWatch 里找不到 Groups.build（" + fnLabel(F.seedWatch) + "）"
 );
 ok(
-  "scanWorld 计算耗时",
-  inBody(F.scanWorld, "GTB_PERF.scan") && inBody(F.scanWorld, "GTB_PERF.worst") && inBody(F.scanWorld, "nowNanos()"),
-  "scanWorld 用 nowNanos() 记 GTB_PERF.scan / worst（心跳里才看得到真实开销）",
-  "nowNanos=" + inBody(F.scanWorld, "nowNanos()") + "，GTB_PERF.scan=" + inBody(F.scanWorld, "GTB_PERF.scan") + "，worst=" + inBody(F.scanWorld, "GTB_PERF.worst")
+  "seedWatch 重置 GTB_WATCH",
+  inBody(F.seedWatch, "GTB_WATCH = {"),
+  "播种前先 GTB_WATCH = { react: {}, gen: {}, logic: {} }，换图不残留上一张图的引用",
+  "seedWatch 里没重置 GTB_WATCH（" + fnLabel(F.seedWatch) + "）"
 );
+ok(
+  "seedWatch 用 arr.index(i) 而不是 seqGet",
+  inBody(F.seedWatch, "arr.index(i)") && !inBody(F.seedWatch, "seqGet("),
+  "全图播种也走 arr.index(i)（seqGet 有多级 try，8311 次调用会慢）",
+  "arr.index(i)=" + inBody(F.seedWatch, "arr.index(i)") + "，seqGet=" + inBody(F.seedWatch, "seqGet(")
+);
+
+// --- 2.5 tick：每 tick 滚动兜底 + 每秒遍历登记表（不再有任何全图）
+(function () {
+  var sweepCalls = occurrences(F.tick ? F.tick.body : "", "sweepWorld()");
+  ok(
+    "tick 里 sweepWorld() 恰好 1 次",
+    F.tick != null && sweepCalls.length === 1,
+    "每 tick 都滚动登记 64 个：tick 里 try { sweepWorld(); } 只调一次",
+    F.tick == null ? "(函数不存在)" : "出现 " + sweepCalls.length + " 次（" + fnLabel(F.tick) + "）"
+  );
+})();
+(function () {
+  var wsCalls = occurrences(F.tick ? F.tick.body : "", "watchStep(");
+  ok(
+    "tick 里 watchStep( 恰好 1 次",
+    F.tick != null && wsCalls.length === 1,
+    "每秒一轮只调 watchStep(now) 一次（别在 tick / 其它事件里重复遍历登记表）",
+    F.tick == null ? "(函数不存在)" : "出现 " + wsCalls.length + " 次（" + fnLabel(F.tick) + "）"
+  );
+})();
+ok(
+  "tick 里没有 scanWorld",
+  F.tick != null && occurrences(F.tick.body, "scanWorld").length === 0,
+  "tick 不该再调 scanWorld（v0.1.3 的每秒全图入口）",
+  F.tick == null ? "(函数不存在)" : "仍有 " + occurrences(F.tick.body, "scanWorld").length + " 处（" + fnLabel(F.tick) + "）"
+);
+(function () {
+  var pSweep = bodyPos(F.tick, "sweepWorld()");
+  var pPerSec = bodyPos(F.tick, "now - GTB.lastScan >= 1000");
+  ok(
+    "sweepWorld 在每秒块之前（每 tick 都跑）",
+    pSweep >= 0 && pPerSec >= 0 && pSweep < pPerSec,
+    "滚动兜底必须每 tick 跑（不跟 1 秒节流），位置在 if (now - GTB.lastScan >= 1000) 之前",
+    "sweepWorld 位置=" + pSweep + "，1 秒块位置=" + pPerSec + "（" + fnLabel(F.tick) + "）"
+  );
+})();
+(function () {
+  var pPerSec = bodyPos(F.tick, "now - GTB.lastScan >= 1000");
+  var pWatch = bodyPos(F.tick, "watchStep(");
+  ok(
+    "watchStep 在每秒块之内",
+    pPerSec >= 0 && pWatch >= 0 && pWatch > pPerSec,
+    "每秒只遍历登记表一次：watchStep(now) 必须在 if (now - GTB.lastScan >= 1000) { … } 里面",
+    "1 秒块位置=" + pPerSec + "，watchStep 位置=" + pWatch + "（" + fnLabel(F.tick) + "）"
+  );
+})();
+
+// --- 2.6 事件增量：建造/配置登记，拆除注销
+ok(
+  "bindEvents 绑定 BlockDestroyEvent → onBuildDestroy",
+  inBody(F.bindEvents, "ET.BlockDestroyEvent") && inBody(F.bindEvents, "onBuildDestroy(e)"),
+  "Events.on(ET.BlockDestroyEvent, function (e) { try { onBuildDestroy(e); } catch (err) { } });",
+  "bindEvents 里缺 BlockDestroyEvent 绑定或 onBuildDestroy(e)（" + fnLabel(F.bindEvents) + "）"
+);
+ok(
+  "onBuildEnd 里 watchAdd(",
+  inBody(F.onBuildEnd, "watchAdd("),
+  "新方块建成即登记：onBuildEnd 里 var wk = watchAdd(b, bk)（只有钍堆/爆混机/逻辑块入表）",
+  "onBuildEnd 里没调 watchAdd(（" + fnLabel(F.onBuildEnd) + "）"
+);
+ok(
+  "onConfig 里 watchAdd(",
+  inBody(F.onConfig, "watchAdd("),
+  "配置变化也续登记：onConfig 里 try { watchAdd(b, tileKey(e.tile)); }（逻辑块改代码 / 发电机塞爆混）",
+  "onConfig 里没调 watchAdd(（" + fnLabel(F.onConfig) + "）"
+);
+ok(
+  "onBuildDestroy 里 watchDrop(tileKey(",
+  inBody(F.onBuildDestroy, "watchDrop(tileKey("),
+  "拆方块即注销：onBuildDestroy 里 watchDrop(tileKey(t))",
+  "onBuildDestroy 里没调 watchDrop(tileKey(（" + fnLabel(F.onBuildDestroy) + "）"
+);
+
+// --- 2.7 watchDrop 必须清掉全部派生表（只涨不消比全图扫描更糟）
+(function () {
+  var DROP_TABLES = [
+    ["delete GTB_WATCH.react[key]", "GTB_WATCH.react"],
+    ["delete GTB_WATCH.gen[key]", "GTB_WATCH.gen"],
+    ["delete GTB_WATCH.logic[key]", "GTB_WATCH.logic"],
+    ["delete GTB_REACTORS[key]", "GTB_REACTORS"],
+    ["delete GTB_GENS[key]", "GTB_GENS"],
+    ["delete GTB_VIRUS[key]", "GTB_VIRUS"],
+    ["delete GTB.builders[key]", "GTB.builders"],
+  ];
+  var missing = [];
+  for (var di = 0; di < DROP_TABLES.length; di++) {
+    if (!inBody(F.watchDrop, DROP_TABLES[di][0])) missing.push(DROP_TABLES[di][1]);
+  }
+  ok(
+    "watchDrop 清掉三张登记表 + 四张派生表",
+    F.watchDrop != null && missing.length === 0,
+    "watchDrop(key) 要 delete：GTB_WATCH.react/gen/logic、GTB_REACTORS、GTB_GENS、GTB_VIRUS、GTB.builders（表只涨不消是回归）",
+    F.watchDrop == null ? "(函数不存在)" : (missing.length === 0 ? "7 张表都清了" : "漏清：" + missing.join("、"))
+  );
+})();
+
+// --- 2.8 世界载入：重置 + 只播种一次
+(function () {
+  var at = clean.indexOf("ET.WorldLoadEvent");
+  var wl = at >= 0 ? blockAt(clean, at) : null;
+  var seeds = occurrences(wl ? wl.body : "", "seedWatch(");
+  ok(
+    "WorldLoadEvent 回调里 seedWatch() 恰好 1 次",
+    wl != null && seeds.length === 1,
+    "全图只在这里过一遍：WorldLoadEvent 回调里 var seeded = 0; try { seeded = seedWatch(); }",
+    wl == null
+      ? "bindEvents 里没找到 ET.WorldLoadEvent"
+      : "seedWatch( 出现 " + seeds.length + " 次（" + where(clean, at) + " 起的回调体）"
+  );
+  ok(
+    "WorldLoad 重置 GTB_WATCH / GTB_SWEEP.i",
+    wl != null && wl.body.indexOf("GTB_WATCH = {") >= 0 && wl.body.indexOf("GTB_SWEEP.i = 0") >= 0,
+    "换图先清空 GTB_WATCH 与 GTB_SWEEP.i/rounds，避免沿用上一张图（旧世界）的方块引用",
+    wl == null
+      ? "(回调不存在)"
+      : "GTB_WATCH 重置=" + (wl.body.indexOf("GTB_WATCH = {") >= 0) +
+        "，GTB_SWEEP.i 重置=" + (wl.body.indexOf("GTB_SWEEP.i = 0") >= 0)
+  );
+})();
+
+// --- 2.9 登记表自身的正确性
+ok(
+  "watchKind 把三类方块分到 react/gen/logic",
+  inBody(F.watchKind, '"thorium-reactor") return "react"') &&
+    inBody(F.watchKind, 'isBlastGenName(name)) return "gen"') &&
+    inBody(F.watchKind, 'isLogicBuild(b)) return "logic"'),
+  'watchKind(b)：thorium-reactor → "react"，isBlastGenName → "gen"，isLogicBuild → "logic"，其余返回 ""',
+  "watchKind 的三条分类缺失（" + fnLabel(F.watchKind) + "）"
+);
+ok(
+  "watchAdd 写进 GTB_WATCH[kind][key]",
+  inBody(F.watchAdd, "GTB_WATCH[kind][key] = b"),
+  "登记表只存这三类：GTB_WATCH[kind][key] = b（kind 为空直接返回空串）",
+  "watchAdd 里没写 GTB_WATCH[kind][key]（" + fnLabel(F.watchAdd) + "）"
+);
+ok(
+  "watchLive 用 isValid() 校验并 watchDrop",
+  inBody(F.watchLive, "ref.isValid()") && inBody(F.watchLive, "watchDrop(key)"),
+  "登记项可能已被拆（事件漏了 / 换了图）：watchLive 里 try { ok = ref.isValid() === true }，为假就 watchDrop",
+  "watchLive 缺 isValid() 校验或 watchDrop（" + fnLabel(F.watchLive) + "）"
+);
+ok(
+  "watchCount 统计三张表",
+  inBody(F.watchCount, "GTB_WATCH.react") &&
+    inBody(F.watchCount, "GTB_WATCH.gen") &&
+    inBody(F.watchCount, "GTB_WATCH.logic"),
+  "watchCount() 三个 for-in 累加（心跳里的 watch=N 就是这个数）",
+  "watchCount 里没统计全三张表（" + fnLabel(F.watchCount) + "）"
+);
+(function () {
+  var pVirus = bodyPos(F.stepLogic, "isVirusCode(");
+  var pStat = bodyPos(F.stepLogic, "GTB.stat.virus");
+  ok(
+    "stepLogic 先判 isVirusCode 并清旧标记",
+    pVirus >= 0 && pStat >= 0 && pVirus < pStat && inBody(F.stepLogic, "delete GTB_VIRUS[key]"),
+    "stepLogic 里代码不匹配 isVirusCode 就 delete GTB_VIRUS[key] 并 return（否则改干净后再注入不再报、且会白算 virus 计数）",
+    "isVirusCode 位置=" + pVirus + "，GTB.stat.virus 位置=" + pStat +
+      "，delete GTB_VIRUS=" + inBody(F.stepLogic, "delete GTB_VIRUS[key]")
+  );
+})();
+
+// --- 2.10 心跳/诊断行（真机排查靠它）
 ok(
   "心跳行带 scan=NNms worst=NNms",
-  inBody(F.tick, '" scan=" + Math.round(GTB_PERF.scan) + "ms worst="') || clean.indexOf('" scan=" + Math.round(GTB_PERF.scan) + "ms worst="') >= 0,
-  "dbg 心跳行含 \" scan=NNms worst=NNms\"（真机排查靠这一行）",
+  inBody(F.tick, '" scan=" + Math.round(GTB_PERF.scan) + "ms worst="') ||
+    clean.indexOf('" scan=" + Math.round(GTB_PERF.scan) + "ms worst="') >= 0,
+  'dbg 心跳行含 " scan=NNms worst=NNms"（真机排查靠这一行）',
   "心跳行里没有 scan=/worst= 片段（" + fnLabel(F.tick) + "）"
+);
+ok(
+  "心跳行带 watch=N sweep=NNms",
+  inBody(F.tick, '" watch=" + GTB_PERF.watch') &&
+    clean.indexOf('" sweep=" + Math.round(GTB_PERF.sweepWorst * 1000) / 1000') >= 0,
+  'dbg 心跳行含 " watch=N"（登记表大小）与 " sweep=NNms"（滚动兜底最坏开销）',
+  '心跳行里缺 " watch=" + GTB_PERF.watch 或 " sweep=" 片段（' + fnLabel(F.tick) + "）"
 );
 ok(
   "GTB_PUNISH.max === 6",
@@ -315,13 +646,14 @@ for (var gi = 0; gi < guarded.length; gi++) {
   );
 }
 (function () {
-  var a = bodyPos(F.tick, "if (inEditor()) return;");
-  var b = bodyPos(F.tick, "scanWorld(");
+  var early = bodyPos(F.tick, "if (inEditor()) return;");
+  var sweep = bodyPos(F.tick, "sweepWorld()");
+  var watch = bodyPos(F.tick, "watchStep(");
   ok(
-    "tick 的编辑器早退在 scanWorld 之前",
-    a >= 0 && b >= 0 && a < b,
-    "先 inEditor() 早退，再谈扫描（否则编辑器里照样全图扫）",
-    "inEditor 位置=" + a + "，scanWorld 位置=" + b
+    "tick 的编辑器早退在 sweepWorld / watchStep 之前",
+    early >= 0 && sweep >= 0 && watch >= 0 && early < sweep && early < watch,
+    "先 inEditor() 早退，再谈兜底登记与每秒遍历（否则编辑器里照样动登记表和世界）",
+    "inEditor 位置=" + early + "，sweepWorld 位置=" + sweep + "，watchStep 位置=" + watch
   );
 })();
 (function () {
@@ -330,7 +662,7 @@ for (var gi = 0; gi < guarded.length; gi++) {
   ok(
     "tick 里落盘在编辑器早退之前",
     a >= 0 && b >= 0 && a < b,
-    "编辑器里改设置也得存得住：dbgFlush/flushSettings 放在 inEditor 早退之前，只是不扫世界",
+    "编辑器里改设置也得存得住：dbgFlush/flushSettings 放在 inEditor 早退之前，只是不碰世界",
     "flushSettings 位置=" + a + "，inEditor 早退位置=" + b
   );
 })();
@@ -356,8 +688,8 @@ for (var gi = 0; gi < guarded.length; gi++) {
 })();
 ok(
   "心跳/WorldLoad 日志带 editor=1",
-  clean.indexOf('(inEditor() ? 1 : 0)') >= 0 && /dbg\("world loaded "/.test(clean),
-  "心跳行 \" editor=\" + (inEditor() ? 1 : 0) 与 WorldLoad 的 editor=1 提示（排查用）",
+  clean.indexOf("(inEditor() ? 1 : 0)") >= 0 && /dbg\("world loaded "/.test(clean),
+  '心跳行 " editor=" + (inEditor() ? 1 : 0) 与 WorldLoad 的 editor=1 提示（排查用）',
   "没找到 editor=1 的诊断输出"
 );
 
@@ -377,7 +709,7 @@ ok(
   "if (!GTB_DIRTY.on) return; + if (now - GTB_DIRTY.at < 1500) return;（tick 每 1.5s 最多落一次盘）",
   "flushSettings 里缺脏标记门或 1500ms 节流（" + fnLabel(F.flushSettings) + "）"
 );
-var hotFns = ["tick", "scanWorld", "swrite", "dbg", "dbgFlush"];
+var hotFns = ["tick", "sweepWorld", "watchStep", "seedWatch", "swrite", "dbg", "dbgFlush"];
 var hotOffenders = [];
 for (var hi = 0; hi < hotFns.length; hi++) {
   if (inBody(F[hotFns[hi]], AUTO)) hotOffenders.push(hotFns[hi]);
@@ -385,7 +717,7 @@ for (var hi = 0; hi < hotFns.length; hi++) {
 ok(
   "热路径函数里没有 autosave",
   hotOffenders.length === 0,
-  "tick / scanWorld / swrite / dbg / dbgFlush 里一次都不能出现 Core.settings.autosave()",
+  "tick / sweepWorld / watchStep / seedWatch / swrite / dbg / dbgFlush 里一次都不能出现 Core.settings.autosave()",
   hotOffenders.length === 0 ? "干净" : "出现在：" + hotOffenders.join(", ") + "（" + fnLabel(F[hotOffenders[0]]) + "）"
 );
 (function () {
