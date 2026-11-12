@@ -495,6 +495,8 @@ function punish(p, reason) {
 // ---------------------------------------------------------------- 行为：交互计数
 
 function noteInteract(p, kind) {
+    // 控单位 / 指挥 / 配置都算「做过别的事」，之后不再按「进服第一个动作」判
+    firstClear(p);
     var cfg0 = cfg();
     if (!cfg0.enable || !cfg0.bh.interact) return;
     if (p == null) return;
@@ -697,6 +699,82 @@ function isLogicBlock(b) {
 
 var GTB_REACTORS = {};
 var GTB_GENS = {};
+// 进服后的第一个动作：如果第一件事就是拆建筑，直接拉黑 + 通告，并把建筑按原样放回去。
+// 只跟踪「刚进服、还没做过任何别的事」的人；建方块 / 改配置 / 控单位 / 指挥都算做过别的事。
+var GTB_FIRST = {};
+
+function firstMark(p) {
+    var uuid = uuidOf(p);
+    if (uuid === "") return;
+    GTB_FIRST[uuid] = { t: nowMs(), done: false };
+}
+
+function firstClear(p) {
+    if (p == null) return;
+    var rec = GTB_FIRST[uuidOf(p)];
+    if (rec != null) rec.done = true;
+}
+
+function firstPending(p) {
+    if (p == null) return false;
+    var rec = GTB_FIRST[uuidOf(p)];
+    return rec != null && rec.done !== true;
+}
+
+// 拆除事件发生在 tile.remove() 之前 ⇒ 这时候还能读到原方块的种类 / 队伍 / 朝向 / 配置 / 血量
+function tileSnapshot(t) {
+    if (t == null) return null;
+    var snap = { block: null, team: null, rot: 0, conf: null, hp: 1 };
+    try {
+        snap.block = t.block();
+        snap.team = t.team();
+        var b = t.build;
+        if (b != null) {
+            try { snap.rot = b.rotation; } catch (e1) { }
+            try { snap.conf = b.config(); } catch (e2) { }
+            try { snap.hp = b.healthf(); } catch (e3) { }
+        }
+    } catch (e) { return null; }
+    return snap.block == null ? null : snap;
+}
+
+// 放回原方块：只在原位已经空了（tile.remove() 之后是 air）时才动，避免盖掉别人刚铺的东西
+function restoreTile(t, snap) {
+    if (t == null || snap == null) return false;
+    try {
+        var air = Packages.mindustry.content.Blocks.air;
+        if (t.block() !== air) return false;
+        t.setBlock(snap.block, snap.team, snap.rot);
+        var nb = t.build;
+        if (nb != null) {
+            try { if (snap.hp < 1) nb.health = snap.block.health * snap.hp; } catch (e1) { }
+            if (snap.conf != null) { try { nb.configured(null, snap.conf); } catch (e2) { } }
+        }
+        return true;
+    } catch (e) { logErr("restore: " + e); return false; }
+}
+
+function firstBreakCheck(e, p) {
+    if (p == null || !firstPending(p)) return;
+    var cfg0 = cfg();
+    if (!cfg0.enable || !cfg0.bh.firstBreak) { firstClear(p); return; }
+    if (isAdmin(p) || targetOf(p) !== "target") { firstClear(p); return; }
+    var t = null, snap = null;
+    try { t = e.tile; } catch (e1) { t = null; }
+    try { snap = tileSnapshot(t); } catch (e2) { snap = null; }
+    var nm = nameOf(p);
+    firstClear(p);
+    punish(p, LIB.REASON.firstBreak);
+    if (snap == null) return;
+    // 拆除事件之后这一帧 tile 才被清空，下一帧再放回去
+    Packages.arc.Core.app.post(function () {
+        try {
+            if (restoreTile(t, snap)) {
+                broadcast(LIB.textInfo("已把 " + nm + " 拆掉的建筑放回原处。"));
+            }
+        } catch (e3) { logErr("restore post: " + e3); }
+    });
+}
 
 // 读建筑里的物品 / 液体：没有对应模块的建筑上 b.items / b.liquids 是 null
 function itemCount(b, item) {
@@ -976,6 +1054,7 @@ function onJoin(p) {
             addWatch(uuid, nameOf(p));
         }
     }
+    if (targetOf(p) === "target") firstMark(p);
 }
 
 function onLeave(p) {
@@ -984,6 +1063,7 @@ function onLeave(p) {
     delete GTB.joinedAt[uuid];
     delete GTB.afk[uuid];
     delete GTB.origTeam[uuid];
+    delete GTB_FIRST[uuid];
     if (GTB.vote != null && GTB.vote.uuid === uuid) GTB.vote = null;
     try { GTB.win.clear(uuid); } catch (e) { }
 }
@@ -995,12 +1075,20 @@ function onBuildEnd(e) {
     if (inEditor()) return;                 // 编辑器：既不改 enabled，也不记建造者
     var cfg0 = cfg();
     if (!cfg0.enable) return;
-    if (e.breaking === true) return;
+    // 拆建筑（ConstructBlock.deconstructFinish 里 tile.remove() 之前触发，带 builder 单位）：
+    // 只有「进服后第一个动作就是拆」要处置 —— 拉黑 + 通告 + 把建筑按原样放回去。
+    if (e.breaking === true) {
+        var pb = null;
+        try { var ub = e.unit; if (ub != null) pb = ub.getPlayer(); } catch (e0) { pb = null; }
+        if (pb != null) { try { firstBreakCheck(e, pb); } catch (eB) { logErr("first break: " + eB); } }
+        return;
+    }
     var p = null;
     try {
         var u = e.unit;
         if (u != null) p = u.getPlayer();
     } catch (err) { p = null; }
+    firstClear(p);
     // 建造不计入「交互」：正常铺产线 10 秒 20 块很常见，计入会误伤；
     // 交互只统计方块配置 / 控单位 / 指挥（见 onConfig 与 UnitControlEvent/BuildingCommandEvent）。
     var b = null;
@@ -1034,6 +1122,7 @@ function onConfig(e) {
     var cfg0 = cfg();
     if (!cfg0.enable) return;
     if (p != null) {
+        firstClear(p);
         noteInteract(p, "配置");
         if (targetOf(p) === "target") {
             var b = null;
@@ -1347,6 +1436,7 @@ function bindEvents() {
         GTB_GENS = {};
         GTB_VIRUS = {};
         GTB_WATCH = { react: {}, gen: {}, logic: {} };
+        GTB_FIRST = {};
         GTB_SWEEP.i = 0;
         GTB_SWEEP.rounds = 0;
         GTB.lastScan = 0;
@@ -1717,6 +1807,8 @@ function selfTest() {
             && typeof inEditor === "function" && typeof flushSettings === "function", "perf/editor helpers");
         chk(watchKind(null) === "" && watchCount() === 0, "watch starts empty");
         chk(typeof watchDrop === "function" && typeof watchAdd === "function", "watch registry helpers");
+    chk(typeof firstBreakCheck === "function" && typeof restoreTile === "function" && typeof tileSnapshot === "function", "first-break helpers");
+    chk(firstPending(null) === false, "first-break starts clean");
     } catch (eQ) { lines.push("FAIL seq: " + eQ); fails.push("seq"); }
     // 黑名单落盘这条路：写进去 → 从 Core.settings 读回 → 再删掉（只在 GTB_SELFTEST 时跑）
     try {

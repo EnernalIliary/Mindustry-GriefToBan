@@ -17,6 +17,11 @@
 //   4) 名单每次变更就 autosave settings.bin ⇒ 主线程磁盘 I/O；改成脏标记 + tick 里节流落盘。
 //   5) 一轮最多处置 GTB_PUNISH.max 个建造者，防一次性几十次 autosave/广播。
 //   6) dbg() 每行一次 open/append/close ⇒ 改成内存缓冲 + dbgFlush() 批量落盘。
+//   7) v0.1.5 新功能「进服后第一个动作就是拆建筑 ⇒ 拉黑 + 通告 + 把建筑按原样放回」：
+//      firstMark 只在 onJoin 末尾对 target 标记；onBuildEnd 的 breaking 分支必须解析在 var p = null 之前
+//      （拆除事件在 tile.remove() 之前触发，先判 firstBreak 再走建造登记）；restoreTile 只在原位是
+//      Blocks.air 时才放回，避免盖掉别人刚铺的方块。lib 的 BH_KEYS / DEFAULTS / REASON 与 ui 的
+//      behaviorRow("firstBreak") 也在这里一起守（跨文件契约，改一处漏一处会错位）。
 //
 // 这里只读源码文本做断言（不执行 main.js，它依赖 Java/Rhino 运行时），所以能在纯 Node 里跑。
 // 零依赖；不改 GriefToBan/ 下任何文件。
@@ -221,6 +226,25 @@ try {
 
 var clean = stripComments(src);
 
+// v0.1.5 起还守两处跨文件契约：gtb-lib.js 的开关表 / gtb-ui.js 的设置行。
+// GTB_LIB_JS / GTB_UI_JS 只给测试自己用（拿临时副本验证断言真的会红）。
+var LIB_REL = process.env.GTB_LIB_JS ? String(process.env.GTB_LIB_JS) : "GriefToBan/scripts/gtb-lib.js";
+var UI_REL = process.env.GTB_UI_JS ? String(process.env.GTB_UI_JS) : "GriefToBan/scripts/gtb-ui.js";
+function readClean(rel) {
+  var file = path.resolve(ROOT, rel);
+  try {
+    return { text: stripComments(fs.readFileSync(file, "utf8")), rel: rel, ok: true, err: "" };
+  } catch (err) {
+    return { text: "", rel: rel, ok: false, err: String(err && err.message ? err.message : err) };
+  }
+}
+function whereIn(src, needle) {
+  var at = src.text.indexOf(needle);
+  return at < 0 ? "未出现（" + src.rel + "）" : src.rel + ":" + lineAt(src.text, at);
+}
+var LIB_SRC = readClean(LIB_REL);
+var UI_SRC = readClean(UI_REL);
+
 var F = {};
 var FN_NAMES = [
   "seqGet", "seqIter", "seqEach",
@@ -228,6 +252,8 @@ var FN_NAMES = [
   "seedWatch", "sweepWorld", "watchStep",
   "tick", "onBuildEnd", "onConfig", "onBuildDestroy", "bindEvents", "stepLogic",
   "inEditor", "dbg", "dbgFlush", "dbgClear", "flushSettings", "swrite", "selfTestWrite",
+  "firstMark", "firstClear", "firstPending", "tileSnapshot", "restoreTile", "firstBreakCheck",
+  "onJoin", "onLeave", "noteInteract", "punish",
 ];
 for (var fi = 0; fi < FN_NAMES.length; fi++) {
   F[FN_NAMES[fi]] = findFunction(clean, FN_NAMES[fi]);
@@ -821,6 +847,174 @@ ok(
   inBody(F.dbg, ">= 3000"),
   "dbg 里 if (GTB_DBG.lines >= 3000) return;（日志不无限长）",
   "dbg 里缺 3000 行上限（" + fnLabel(F.dbg) + "）"
+);
+
+// ================================================================ 7. 进服第一个动作拆建筑
+section("进服第一个动作拆建筑");
+
+(function () {
+  var need = ["firstMark", "firstClear", "firstPending", "tileSnapshot", "restoreTile", "firstBreakCheck"];
+  var miss = [];
+  for (var i = 0; i < need.length; i++) if (F[need[i]] == null) miss.push(need[i]);
+  var decl = declaration(clean, "GTB_FIRST");
+  ok(
+    "GTB_FIRST 表 + 六个 first* 函数都在",
+    decl != null && miss.length === 0,
+    "var GTB_FIRST = {}; 且 firstMark / firstClear / firstPending / tileSnapshot / restoreTile / firstBreakCheck 六个函数都要在",
+    (decl == null ? "缺 var GTB_FIRST = {};" : where(clean, decl.index)) +
+      (miss.length ? "；缺函数：" + miss.join(", ") : "")
+  );
+})();
+ok(
+  "firstMark 忽略没有 uuid 的玩家",
+  inBody(F.firstMark, 'if (uuid === "") return;'),
+  "firstMark 里 if (uuid === \"\") return;（没 uuid 跟踪不了，直接不记）",
+  "firstMark 里缺空 uuid 守卫（" + fnLabel(F.firstMark) + "）"
+);
+(function () {
+  var needle = 'if (targetOf(p) === "target") firstMark(p);';
+  var pos = bodyPos(F.onJoin, needle);
+  var tail = F.onJoin == null || pos < 0 ? -1 : F.onJoin.body.length - (pos + needle.length);
+  ok(
+    "onJoin 末尾按 target 标记 firstMark",
+    pos >= 0 && tail >= 0 && tail < 80,
+    "onJoin 结尾 if (targetOf(p) === \"target\") firstMark(p);（只跟踪 target：管理员 / 观察模式外人不受影响）",
+    pos < 0
+      ? "onJoin 里没找到该语句（" + fnLabel(F.onJoin) + "）"
+      : "找到了，但后面还有 " + tail + " 个字符，不像是最后一步（" + bodyWhere(F.onJoin, pos) + "）"
+  );
+})();
+ok(
+  "onLeave 清掉 GTB_FIRST 记录",
+  inBody(F.onLeave, "delete GTB_FIRST[uuid];"),
+  "onLeave 里 delete GTB_FIRST[uuid];（离服就忘，重进重新算第一动作）",
+  "onLeave 里没有 delete GTB_FIRST[uuid];（" + fnLabel(F.onLeave) + "）"
+);
+(function () {
+  var at = clean.indexOf("ET.WorldLoadEvent");
+  var blk = at < 0 ? null : blockAt(clean, at);
+  ok(
+    "WorldLoadEvent 回调重置 GTB_FIRST",
+    inBody(blk, "GTB_FIRST = {};"),
+    "换图时 GTB_FIRST = {};（上局的人不能带到新地图）",
+    at < 0
+      ? "bindEvents 里没找到 ET.WorldLoadEvent"
+      : "WorldLoadEvent 回调体里没有 GTB_FIRST = {};（" +
+        (blk == null ? "回调体没解析出来" : where(clean, clean.indexOf(blk.body))) + "）"
+  );
+})();
+
+var brkPos = bodyPos(F.onBuildEnd, "if (e.breaking === true)");
+var pVarPos = bodyPos(F.onBuildEnd, "var p = null;");
+ok(
+  "onBuildEnd 单独处理 breaking 拆除事件",
+  brkPos >= 0,
+  "if (e.breaking === true) { ... }（ConstructBlock.deconstructFinish 在 tile.remove() 之前带 builder 触发）",
+  "onBuildEnd 里没有 if (e.breaking === true)（" + fnLabel(F.onBuildEnd) + "）"
+);
+ok(
+  "breaking 分支在 var p = null 之前",
+  brkPos >= 0 && pVarPos > brkPos,
+  "先处理拆除（此时 e.unit 是拆除者），再解析建造者 var p；顺序反了就拿不到正确的 p",
+  "breaking 位置=" + brkPos + "，var p = null 位置=" + pVarPos + "（" + fnLabel(F.onBuildEnd) + "）"
+);
+ok(
+  "breaking 分支调 firstBreakCheck(e, pb)",
+  inBody(F.onBuildEnd, "firstBreakCheck(e, pb)"),
+  "breaking 分支里 firstBreakCheck(e, pb)（pb 由 e.unit.getPlayer() 得来）",
+  "breaking 分支里没调 firstBreakCheck(e, pb)（" + fnLabel(F.onBuildEnd) + "）"
+);
+ok(
+  "非 breaking 路径 firstClear(p)",
+  pVarPos >= 0 && bodyPos(F.onBuildEnd, "firstClear(p);") > pVarPos,
+  "建方块也算「做过别的事」：非 breaking 路径在 var p 之后调 firstClear(p)",
+  "onBuildEnd 里 firstClear(p); 位置=" + bodyPos(F.onBuildEnd, "firstClear(p);") +
+    "，var p = null 位置=" + pVarPos + "（" + fnLabel(F.onBuildEnd) + "）"
+);
+ok(
+  "firstBreakCheck 受 bh.firstBreak 开关控制",
+  inBody(F.firstBreakCheck, "!cfg0.bh.firstBreak") && inBody(F.firstBreakCheck, "firstClear(p)"),
+  "if (!cfg0.enable || !cfg0.bh.firstBreak) { firstClear(p); return; }",
+  "firstBreakCheck 里缺 firstBreak 开关判断（" + fnLabel(F.firstBreakCheck) + "）"
+);
+ok(
+  "firstBreakCheck 只处置 target 且跳过管理员",
+  inBody(F.firstBreakCheck, 'isAdmin(p) || targetOf(p) !== "target"'),
+  "if (isAdmin(p) || targetOf(p) !== \"target\") { firstClear(p); return; }",
+  "firstBreakCheck 里缺管理员 / target 判断（" + fnLabel(F.firstBreakCheck) + "）"
+);
+ok(
+  "firstBreakCheck 用 REASON.firstBreak 拉黑",
+  inBody(F.firstBreakCheck, "punish(p, LIB.REASON.firstBreak);"),
+  "punish(p, LIB.REASON.firstBreak)（reason 文案由 lib 统一维护）",
+  "firstBreakCheck 里没调 punish(p, LIB.REASON.firstBreak)（" + fnLabel(F.firstBreakCheck) + "）"
+);
+ok(
+  "拆除后延到下一帧放回建筑",
+  inBody(F.firstBreakCheck, "Packages.arc.Core.app.post(") &&
+    inBody(F.firstBreakCheck, "restoreTile(t, snap)"),
+  "Core.app.post(function () { ... restoreTile(t, snap) ... })：拆除事件后这一帧 tile 才清空，下一帧再放回",
+  "firstBreakCheck 里缺 Core.app.post( 或 restoreTile(t, snap)（" + fnLabel(F.firstBreakCheck) + "）"
+);
+(function () {
+  var guard = bodyPos(F.restoreTile, "if (t.block() !== air) return false;");
+  var setb = bodyPos(F.restoreTile, "t.setBlock(snap.block, snap.team, snap.rot)");
+  ok(
+    "restoreTile 只在原位是 air 时放回",
+    guard >= 0 && setb > guard,
+    "先 if (t.block() !== air) return false; 再 setBlock —— 不许盖掉别人刚铺的方块",
+    "guard 位置=" + guard + "，setBlock 位置=" + setb + "（" + fnLabel(F.restoreTile) + "）"
+  );
+  ok(
+    "restoreTile 还原方块/队伍/朝向/配置",
+    setb >= 0 && inBody(F.restoreTile, "nb.configured(null, snap.conf)"),
+    "t.setBlock(snap.block, snap.team, snap.rot) + nb.configured(null, snap.conf)（配置方块连 config 一起还原）",
+    "restoreTile 里缺三参 setBlock 或 configured(null, snap.conf)（" + fnLabel(F.restoreTile) + "）"
+  );
+})();
+(function () {
+  var clr = bodyPos(F.onConfig, "firstClear(p);");
+  var ni = bodyPos(F.onConfig, "noteInteract(");
+  ok(
+    "onConfig 里 firstClear 早于 noteInteract",
+    clr >= 0 && ni > clr,
+    "改配置 = 做过别的事：if (p != null) { firstClear(p); noteInteract(p, \"配置\"); ... }",
+    "firstClear 位置=" + clr + "，noteInteract 位置=" + ni + "（" + fnLabel(F.onConfig) + "）"
+  );
+})();
+ok(
+  "noteInteract 一进来就 firstClear",
+  bodyPos(F.noteInteract, "firstClear(p);") >= 0 &&
+    bodyPos(F.noteInteract, "firstClear(p);") < bodyPos(F.noteInteract, "cfg()"),
+  "noteInteract 第一句 firstClear(p)（控单位 / 指挥 / 配置都算做过别的事）",
+  "noteInteract 里 firstClear(p) 不在开头（" + fnLabel(F.noteInteract) + "）"
+);
+ok(
+  "lib: BH_KEYS / DEFAULTS 都有 firstBreak",
+  /var BH_KEYS = \[[^\]]*"firstBreak"\]/.test(LIB_SRC.text) &&
+    /bh:\s*\{[^}]*firstBreak:\s*true/.test(LIB_SRC.text),
+  "gtb-lib.js: BH_KEYS 末位 \"firstBreak\"、DEFAULTS.bh.firstBreak = true（默认开）",
+  LIB_SRC.ok
+    ? "BH_KEYS / DEFAULTS 里缺 firstBreak（" + whereIn(LIB_SRC, "BH_KEYS") + "）"
+    : "读不到 " + LIB_SRC.rel + "：" + LIB_SRC.err
+);
+ok(
+  "lib: REASON.firstBreak 文案非空",
+  /REASON[\s\S]{0,800}?firstBreak:\s*"[^"]+"/.test(LIB_SRC.text),
+  "gtb-lib.js: REASON.firstBreak = \"...\"（写进黑名单 reason + 全服通告）",
+  LIB_SRC.ok
+    ? "REASON 里没有非空的 firstBreak 文案（" + whereIn(LIB_SRC, "var REASON") + "）"
+    : "读不到 " + LIB_SRC.rel + "：" + LIB_SRC.err
+);
+ok(
+  "ui: 行为设置里新增 firstBreak 一行（七项）",
+  UI_SRC.ok && /behaviorRow\(\s*c\s*,\s*"firstBreak"/.test(UI_SRC.text) &&
+    UI_SRC.text.indexOf("七项") >= 0,
+  "gtb-ui.js buildBehaviors: behaviorRow(c, \"firstBreak\", ...) 且说明行从「六项」改成「七项」",
+  UI_SRC.ok
+    ? "behaviorRow(firstBreak)=" + (/behaviorRow\(\s*c\s*,\s*"firstBreak"/.test(UI_SRC.text) ? "有" : "无") +
+      "，七项=" + (UI_SRC.text.indexOf("七项") >= 0 ? "有" : "无") + "（" + whereIn(UI_SRC, "buildBehaviors") + "）"
+    : "读不到 " + UI_SRC.rel + "：" + UI_SRC.err
 );
 
 // ================================================================ 汇总

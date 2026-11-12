@@ -3,7 +3,7 @@
 // 编码约束：本文件会被 Mindustry 的 Rhino 加载，只允许 ES5 写法（var / function），
 // 禁止正则字面量（Rhino 构造期会 FAILED ASSERTION: invalid bytecode），一律手写字符扫描。
 
-var VERSION = "0.1.4";
+var VERSION = "0.1.5";
 var P = "grief-to-ban.";
 
 // 设置键（存进 Core.settings）
@@ -26,14 +26,14 @@ var K = {
     emph: P + "emph-color"
 };
 
-var BH_KEYS = ["interact", "virus", "reactorNear", "reactorBoom", "blastGen", "afk"];
+var BH_KEYS = ["interact", "virus", "reactorNear", "reactorBoom", "blastGen", "afk", "firstBreak"];
 
 var DEFAULTS = {
     enable: true,
     vanillaBan: false,
     langMode: "off",
     langs: "",
-    bh: { interact: true, virus: true, reactorNear: true, reactorBoom: true, blastGen: true, afk: true },
+    bh: { interact: true, virus: true, reactorNear: true, reactorBoom: true, blastGen: true, afk: true, firstBreak: true },
     thInteractCount: 20,
     thInteractWindow: 10,
     thReactorNear: 30,
@@ -502,6 +502,7 @@ var REASON = {
     reactorBoom: "钍堆在烧钍、没通冷冻液（随时会炸）",
     blastGen: "涡轮/火电里装着爆混",
     afk: "附身单位 AFK 过久",
+    firstBreak: "进服后第一个动作就是拆建筑",
     lang: "语言黑名单"
 };
 

@@ -9,7 +9,10 @@
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..", "..");
-const LIB_FILE = path.join(ROOT, "GriefToBan", "scripts", "gtb-lib.js");
+// 默认只测仓库里的 gtb-lib.js；GTB_LIB_JS 只给测试自己用（拿临时副本验证断言真的会红）。
+const LIB_FILE = process.env.GTB_LIB_JS
+  ? path.resolve(process.env.GTB_LIB_JS)
+  : path.join(ROOT, "GriefToBan", "scripts", "gtb-lib.js");
 
 let L = null;
 try {
@@ -294,7 +297,7 @@ eq("LANGS 第一项是 zh_cn / 中文（简体）", L.LANGS[0], ["zh_cn", "中�
 // ================================================================ 行为开关
 sec("行为: parseBehaviors / dumpBehaviors");
 
-const bhAllTrue = { interact: true, virus: true, reactorNear: true, reactorBoom: true, blastGen: true, afk: true };
+const bhAllTrue = { interact: true, virus: true, reactorNear: true, reactorBoom: true, blastGen: true, afk: true, firstBreak: true };
 eq("parseBehaviors('') -> 全默认", L.parseBehaviors(""), bhAllTrue);
 eq("parseBehaviors(null) -> 全默认", L.parseBehaviors(null), bhAllTrue);
 eq("parseBehaviors 非法 JSON -> 全默认", L.parseBehaviors("garbage"), bhAllTrue);
@@ -305,6 +308,12 @@ eq("parseBehaviors 字符串 'true' 视为 true", L.parseBehaviors('{"interact":
 eq("parseBehaviors 数字 1 视为 true", L.parseBehaviors('{"virus":1}').virus, true);
 eq("parseBehaviors 其它字符串视为 false", L.parseBehaviors('{"virus":"yes"}').virus, false);
 eq("parseBehaviors 'TRUE'（大写）视为 true", L.parseBehaviors('{"virus":"TRUE"}').virus, true);
+const bhFirst = L.parseBehaviors('{"firstBreak":false}');
+eq("parseBehaviors firstBreak=false -> false", bhFirst.firstBreak, false);
+eq("parseBehaviors 关 firstBreak 不影响其它项", bhFirst.interact, true);
+eq("parseBehaviors firstBreak 默认为 true", L.parseBehaviors("").firstBreak, true);
+eq("DEFAULTS.bh.firstBreak 默认开", L.DEFAULTS.bh.firstBreak, true);
+
 const bhUnknown = L.parseBehaviors('{"nope":true,"interact":false}');
 eq("parseBehaviors 未知键被忽略", Object.keys(bhUnknown).sort(), L.BH_KEYS.slice().sort());
 eq("parseBehaviors 未知键不影响已知键", bhUnknown.interact, false);
@@ -313,7 +322,13 @@ const bhDump = L.dumpBehaviors(null);
 eq(
   "dumpBehaviors(null) -> 全 true 的 JSON（键序 = BH_KEYS）",
   bhDump,
-  '{"interact":true,"virus":true,"reactorNear":true,"reactorBoom":true,"blastGen":true,"afk":true}'
+  '{"interact":true,"virus":true,"reactorNear":true,"reactorBoom":true,"blastGen":true,"afk":true,"firstBreak":true}'
+);
+ok(
+  "dumpBehaviors 键序末位是 firstBreak",
+  /"firstBreak":true\}$/.test(bhDump),
+  '...\"firstBreak\":true}',
+  bhDump
 );
 eq("dumpBehaviors 只认严格 true（1 不算）", JSON.parse(L.dumpBehaviors({ interact: 1 })).interact, false);
 eq(
@@ -557,9 +572,16 @@ ok(
   }),
   L.COLOR
 );
+ok(
+  "REASON.firstBreak 文案非空",
+  typeof L.REASON.firstBreak === "string" && L.REASON.firstBreak.length > 0,
+  "非空字符串（写进黑名单 reason，也广播给全服）",
+  L.REASON.firstBreak
+);
 eq("REASON 键齐全", Object.keys(L.REASON).sort(), [
   "afk",
   "blastGen",
+  "firstBreak",
   "interact",
   "lang",
   "reactorBoom",
@@ -600,7 +622,7 @@ ok(
 );
 eq("KEYS.langMode", L.KEYS.langMode, "grief-to-ban.lang-mode");
 eq("KEYS.thInteractCount", L.KEYS.thInteractCount, "grief-to-ban.th-interact-count");
-eq("BH_KEYS 顺序与默认一致", L.BH_KEYS, ["interact", "virus", "reactorNear", "reactorBoom", "blastGen", "afk"]);
+eq("BH_KEYS 顺序与默认一致", L.BH_KEYS, ["interact", "virus", "reactorNear", "reactorBoom", "blastGen", "afk", "firstBreak"]);
 
 // ================================================================ 汇总
 function summary() {

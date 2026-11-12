@@ -520,7 +520,7 @@ function behaviorRow(c, key, label, expl){
 
 function buildBehaviors(c){
     section("行为黑名单");
-    descLine("六项可以逐项开关；勾上的项在检测到后按每项下面写的方式处理（拉黑 = 转旁观并广播通告）。");
+    descLine("七项可以逐项开关；勾上的项在检测到后按每项下面写的方式处理（拉黑 = 转旁观并广播通告）。");
 
     // ① 短时间多次交互 / 指挥大量单位
     behaviorRow(c, "interact", "短时间多次交互 / 指挥大量单位",
@@ -553,6 +553,11 @@ function buildBehaviors(c){
     behaviorRow(c, "afk", "附身单位 AFK（@shootx @shooty 不动）",
         "踢出 + 通告：附身单位在阈值时间内坐标没变化就判定为挂机。");
     numRow("AFK 阈值", c.afkMinutes, L.KEYS.afkMinutes, 1, 120, "分钟");
+
+    // ⑦ 进服后第一个动作就是拆建筑
+    behaviorRow(c, "firstBreak", "进服后的第一件事就是拆建筑",
+        "拉黑 + 通告 + 把被拆的建筑按原样放回原处。只判「还没做过任何别的事」的人；"
+        + "先建方块、改配置、控单位或指挥过的都不算。");
 }
 
 // ---------------------------------------------------------------- 5. votekick
