@@ -541,13 +541,13 @@ function buildBehaviors(c){
     behaviorRow(c, "reactorNear", "钍堆离核心过近", "警告 + 通告：只提醒不处置，留给玩家自己搬走。");
     numRow("距离阈值", c.thReactorNear, L.KEYS.thReactorNear, 1, 200, "格");
 
-    // ④ 钍堆热量不为 0
-    behaviorRow(c, "reactorBoom", "钍堆热量不为 0（随时会炸）",
-        "停用该钍堆直到热量归零 + 拉黑 + 通告；停不掉方块时退化为把热量清 0。");
+    // ④ 钍堆在烧钍（热量会涨）
+    behaviorRow(c, "reactorBoom", "钍堆在烧钍、没通冷冻液",
+        "停用 + 拉黑 + 通告。把钍取空或通入冷冻液后自动恢复 —— 不再用「热量归零」当判据（钍还在时热量降下来就会再涨，会来回跳）。");
 
-    // ⑤ 给涡轮 / 火电装爆混
-    behaviorRow(c, "blastGen", "给涡轮 / 火电装爆混",
-        "清空该发电机的物品并停用 + 警告 + 通告。");
+    // ⑤ 涡轮 / 火电里装着爆混
+    behaviorRow(c, "blastGen", "涡轮 / 火电里装着爆混",
+        "只停用，不清空爆混；同一个方块只提示与拉黑一次，玩家再打开就静默再停。");
 
     // ⑥ 附身单位 AFK
     behaviorRow(c, "afk", "附身单位 AFK（@shootx @shooty 不动）",

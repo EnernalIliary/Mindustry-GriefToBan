@@ -2,6 +2,49 @@
 
 只记对外可见的变化。工程细节见 `out/takeover-20261024/` 下的报告。
 
+## 0.1.3
+
+修用户报的「启用 Grief to Ban 之后地图编辑器加载很久、长时间未响应」，外加三条行为调整。
+
+- **主线程每秒被白白烧掉 370 ms**（用户 m10300：造成卡顿的是 Grief to Ban）。v160 的
+  `Groups.build` / `Groups.player` 是 `mindustry.entities.EntityGroup`，只有 size() / index(int) /
+  each(...)，**没有 get(int)**；旧 `seqGet()` 先试 `seq.get(i)`，每个方块抛一次 Rhino
+  TypeError 再被 catch 吞掉。真 v160 引擎实测：一次「引擎抛异常」**13.8–15.8 µs**（中位 14.87），
+  而无异常的 `index(0)` 只要 0.36–0.46 µs —— 成本几乎全在 Rhino 构造异常对象（要调
+  Building.toString()），跟方块多少无关。每秒 3 遍扫描 × 8311 个方块 ≈ 2.5 万次异常/s
+  ⇒ **370.8 ms/s ≈ 37% 墙钟**，而且三遍还连在同一个 tick 里跑，真机就是「每秒一次约 370 ms
+  的主线程整段停顿」。现在 `seqGet` 先走 `index(i)`，无异常取元素。
+- **三遍全图扫描合成一遍**：以前 `scanReactors` / `scanGenerators` / `scanVirusQuick` 各自
+  `for i < Groups.build.size()` + `seqGet`，一秒钟三遍全图、三倍异常。现在只有一个
+  `scanWorld()` 走一遍 `Groups.build`，循环里直接 `arr.index(i)`，分别交给
+  `stepReactor` / `stepGen` / `stepLogic`。同一工作量从约 371 ms/s 掉到约 3.3 ms/s。
+  耗时挂到 `GTB_PERF.scan/worst/builds`，系统属性 `gtb.scan` 与心跳日志都带
+  `ms= / worst= / builds=`，单轮 ≥40 ms 记一行 `scan slow`。
+- **地图编辑器里完全不扫**：编辑器模式（`Vars.state.rules.editor`）下 tick 直接返回，
+  `onBuildEnd` / `onConfig` 也早退 —— 编辑器里没有要处置的东西，但方块数可以上万，
+  以前是边编辑边每秒卡一次。日志与心跳带 `editor=1`，世界加载行会写明是否进了编辑器。
+- **设置不再一处一写盘**：以前每一处 `swrite()` 都调 `Core.settings.autosave()`（整份
+  settings.bin，本机 287 KB），一次事件里改几处就在同一帧写几遍。现在同值不写、只标脏，
+  tick 里最多每 1.5 s 冲一次，世界加载后立刻冲一次。
+- **debug 日志不再逐行开关文件**：每行 open/write/close 改成内存缓冲，40 行或 500 ms 后
+  一次落盘；「诊断信息 / 查看日志 / 导出」前强制冲刷。
+- **钍堆恢复条件改了**（用户 m10061）：以前「热量掉到 0 就恢复」，但钍还在，恢复后热量
+  又涨上来 ⇒ 停用、恢复、停用无限循环，每次都广播一次。现在只有**钍取空**或**通了冷冻液**
+  才恢复（`reactorSafe()`），其它情况保持停用且不再重复提示（日志一行 `reactor held`）。
+- **爆混机只停用、不清空**（用户 m10061）：以前 `b.items.set(blastCompound, 0)` 把玩家的
+  爆混凭空删掉。现在只 `setEnabled(false)`，材料原样留着；同一台方块只提示与处置一次
+  （`GTB_GENS` 记录），玩家再把它打开就静默再停；爆混被取走则清掉记录。
+- **装爆混的人真的会被拉黑**（用户 m10061）：旧代码只给钍堆记建造者，发电机命中时只知道
+  「方块有问题」不知道是谁建的。现在 `onBuildEnd` 对**所有方块**都记建造者，爆混机命中就
+  拉黑建造者（在线走 `punish`，离线直接写名单）。一轮最多处置 6 个，其余下一秒继续，
+  不会在一个 tick 里连发一堆封禁；管理员建的只广播「只停用，不拉黑」。
+- **管理员真的被移出黑名单**（用户 m10076）：以前 `removeBlacklist()` 只删名单、不回队伍，
+  人还停在队伍 0（旁观），看起来就像「切了管理员也没移出黑名单」。现在同时
+  `restoreTeam()` 回到原队伍，广播与私聊都写明「已移出黑名单，并恢复到原来的队伍」。
+- **ESC 菜单入口带图标**（用户 m10086）：`Grief to Ban` 按钮改用 `Icon.hammer`，
+  取不到图标时退回纯文字按钮。
+- 自检多了两条：`seqGet` 必须先走 `index()`；perf / editor 辅助函数存在。
+
 ## 0.1.2
 
 - **自动更新在限流下也能用**：api.github.com 按 IP 限流（本机实测 403 rate limit exceeded），

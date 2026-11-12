@@ -68,22 +68,40 @@ function sread(key) {
     }
 }
 
+// 同值不重复写，autosave 攒起来由 tick 最多 1.5 秒落一次盘。
+// 原来每次名单变动都 put + 读回 + Core.settings.autosave()（写 287KB settings.bin 并滚动备份），
+// 而真机日志里黑名单成对重写（len=106 → len=2）每秒来一次 ⇒ 主线程被磁盘 I/O 拖住。
+var GTB_DIRTY = { on: false, at: 0 };
+
 function swrite(key, value) {
     try {
-        if (typeof value === "boolean") Core.settings.put(key, value);
-        else if (typeof value === "number") Core.settings.put(key, LIB.toInt(value, 0));
-        else {
+        if (typeof value === "boolean") {
+            if (sread(key) === value) return;
+            Core.settings.put(key, value);
+        } else if (typeof value === "number") {
+            if (LIB.toInt(sread(key), -999999) === LIB.toInt(value, 0)) return;
+            Core.settings.put(key, LIB.toInt(value, 0));
+        } else {
             var s = value == null ? "" : String(value);
+            if (String(sread(key)) === s) return;          // 内容没变：不写、不落盘、不记日志
             Core.settings.put(key, s);
             var back = "";
             try { back = Core.settings.getString(key, ""); } catch (e1) { back = ""; }
             if (String(back) !== s) dbg("swrite MISMATCH " + key + " want=" + s.length + " got=" + String(back).length);
             else dbg("swrite " + key + " len=" + String(back).length);
         }
-        try { Core.settings.autosave(); } catch (e9) { }
+        GTB_DIRTY.on = true;
     } catch (e) {
         logInfo("写设置失败 " + key + "：" + e);
     }
+}
+
+function flushSettings(now) {
+    if (!GTB_DIRTY.on) return;
+    if (now - GTB_DIRTY.at < 1500) return;
+    GTB_DIRTY.at = now;
+    GTB_DIRTY.on = false;
+    try { Core.settings.autosave(); } catch (e9) { }
 }
 
 function rebuildMaps() {
@@ -132,29 +150,47 @@ function dbgFile() {
     return GTB_DBG.file;
 }
 
+// 日志先攒内存、成批落盘：原来每行一次 open/append/close，大图上每秒几十行 ⇒ 主线程 I/O。
+// 攒满 40 行或每 500ms 由 tick 冲一次；行数上限仍是 3000。
+var GTB_DBG_BUF = { lines: [], at: 0 };
+
 function dbg(msg) {
     try {
-        var f = dbgFile();
-        if (f == null) return;
         if (GTB_DBG.lines >= 3000) return;
         GTB_DBG.lines = GTB_DBG.lines + 1;
-        f.writeString(nowMs() + " " + String(msg) + "\n", true);
+        GTB_DBG_BUF.lines.push(nowMs() + " " + String(msg));
+        if (GTB_DBG_BUF.lines.length >= 40) dbgFlush();
     } catch (e) { }
+}
+
+function dbgFlush() {
+    try {
+        if (GTB_DBG_BUF.lines.length === 0) return;
+        var s = GTB_DBG_BUF.lines.join("\n") + "\n";
+        GTB_DBG_BUF.lines = [];
+        GTB_DBG_BUF.at = nowMs();
+        var f = dbgFile();
+        if (f == null) return;
+        f.writeString(s, true);
+    } catch (e) { try { GTB_DBG_BUF.lines = []; } catch (e2) { } }
 }
 
 function dbgClear() {
     try {
         var f = dbgFile();
         if (f == null) return false;
+        try { GTB_DBG_BUF.lines = []; } catch (e0) { }
         f.writeString("", false);
         GTB_DBG.lines = 0;
         dbg("log cleared");
+        dbgFlush();
         return true;
     } catch (e) { return false; }
 }
 
 function dbgText() {
     try {
+        dbgFlush();
         var f = dbgFile();
         if (f == null) return "拿不到 dataDirectory";
         if (!f.exists()) return "还没有日志（gtb-debug.log）";
@@ -235,6 +271,22 @@ function isAuthority() {
     return true;                           // 说不清时按房主处理，宁可多记一行日志也别静默失效
 }
 
+// 地图编辑器（Rules.editor=true，Rules.java:51）是单人沙盒：没有别人可 grief，
+// 方块只是地图数据。以前这套东西在里面照跑（每秒 3 遍全图扫描 + 改 enabled），
+// 这就是「启用本模组后进编辑器很慢、长时间未响应」的来源（用户 2026-11-12 报）。
+// 编辑器里 tick / onBuildEnd / onConfig 一律不碰世界。
+var GTB_EDITOR_SEEN = false;
+
+function inEditor() {
+    try {
+        var st = Vars.state;
+        if (st == null) return false;
+        var r = st.rules;
+        if (r != null && r.editor === true) { GTB_EDITOR_SEEN = true; return true; }
+    } catch (e) { }
+    return false;
+}
+
 function seqSize(seq) {
     if (seq == null) return 0;
     try {
@@ -254,13 +306,29 @@ function seqEach(seq, fn) {
 }
 
 // Groups.* 在 v160 里是 mindustry.entities.EntityGroup（不是 arc 的 Seq）：
-// 只有 size() / index(int) / each(...)，**没有 get(int)**。这一条曾让所有扫描静默空转。
+// 只有 size() / index(int) / each(...)（EntityGroup.java:231/235），**没有 get(int)**。
+// 这条曾让所有扫描静默空转；更糟的是老写法「先试 seq.get(i)」会给每个元素抛一次
+// TypeError 再被 catch 吃掉 —— 大图 8311 个方块 × 每秒 3 遍扫描 ≈ 每秒 2.5 万次异常构造，
+// 主线程被吃干净，真机表现就是「进地图编辑器后长时间未响应」（用户 2026-11-12 报）。
+// 现在 index() 在前，热路径不再产生任何异常。
 function seqGet(seq, i) {
     if (seq == null) return null;
-    try { var a = seq.get(i); if (a != null) return a; } catch (e) { }
     try { var b2 = seq.index(i); if (b2 != null) return b2; } catch (e2) { }
+    try { var a = seq.get(i); if (a != null) return a; } catch (e) { }
     try { var arr = seq.items; if (arr != null && i < arr.length) return arr[i]; } catch (e3) { }
     return null;
+}
+
+// 热路径遍历：size 只算一次，循环里只调 index(i)。
+function seqIter(seq, fn) {
+    if (seq == null || fn == null) return 0;
+    var n = seqSize(seq);
+    for (var i = 0; i < n; i++) {
+        var it = null;
+        try { it = seq.index(i); } catch (e) { continue; }
+        if (it != null) fn(it, i);
+    }
+    return n;
 }
 
 function eachPlayer(fn) {
@@ -628,86 +696,150 @@ function isLogicBlock(b) {
 // ---------------------------------------------------------------- 扫描：钍堆热量 / 爆混发电机
 
 var GTB_REACTORS = {};
+var GTB_GENS = {};
 
-function scanReactors() {
+// 读建筑里的物品 / 液体：没有对应模块的建筑上 b.items / b.liquids 是 null
+function itemCount(b, item) {
+    if (b == null) return 0;
+    try {
+        if (b.items != null) return LIB.toInt(b.items.get(item), 0);
+    } catch (e) { }
+    return 0;
+}
+
+function liquidAmount(b, liquid) {
+    if (b == null) return 0;
+    try {
+        if (b.liquids != null) return Number(b.liquids.get(liquid));
+    } catch (e) { }
+    return 0;
+}
+
+function hasCryo(b) {
+    try { return liquidAmount(b, Packages.mindustry.content.Liquids.cryofluid) > 0.0001; } catch (e) { return false; }
+}
+
+// 钍堆什么时候可以重新启用：钍被取空，或者已经通上冷冻液（热量会自己降下来）。
+// 不用「热量归零」当判据 —— 钍还在时热量会一直涨，归零就恢复等于让它在 0 和 100 之间来回跳。
+function reactorSafe(b) {
+    try { if (itemCount(b, Packages.mindustry.content.Items.thorium) <= 0) return true; } catch (e) { }
+    return hasCryo(b);
+}
+
+function isBlastGenName(name) {
+    return name === "steam-generator" || name === "combustion-generator" || name === "turbine-generator";
+}
+
+function genLabel(name) {
+    if (name === "steam-generator") return "蒸汽发电机";
+    if (name === "turbine-generator") return "涡轮发电机";
+    return "火电";
+}
+
+// 处置建造者：在线就当场拉黑 + 转旁观，离线就写进黑名单。
+// 爆混发电机 / 钍堆都要能追到人，否则「停用了但没人被拉黑」等于没处置。
+function punishBuilder(owner, reason, extra) {
+    var msg = extra == null ? "" : String(extra);
+    // 一轮扫描里处置太多人 = 一次性几十次 autosave + 广播，主线程会被堵住；
+    // 超出预算的先只停用，下一秒那轮再拉黑（对 grief 来说晚 1 秒没有区别）。
+    if (GTB_PUNISH.n >= GTB_PUNISH.max) {
+        dbg("punish budget full, defer " + (owner == null ? "-" : owner.name));
+        if (msg !== "") broadcast(LIB.textInfo(msg));
+        return;
+    }
+    GTB_PUNISH.n = GTB_PUNISH.n + 1;
+    if (owner != null) {
+        var op = playerByUuid(owner.uuid);
+        if (op != null) {
+            if (isAdmin(op)) {
+                dbg("owner is admin, skip punish: " + nameOf(op));
+                broadcast(LIB.textInfo("建造者是管理员 " + nameOf(op) + "，只停用不拉黑。" + msg));
+                return;
+            }
+            punish(op, reason);
+            if (msg !== "") broadcast(LIB.textInfo(msg));
+            return;
+        }
+        addBlacklist(owner.uuid, owner.name, reason, true);
+        broadcast(LIB.textBan(owner.name, reason));
+        if (msg !== "") broadcast(LIB.textInfo(msg));
+        return;
+    }
+    if (msg !== "") broadcast(LIB.textInfo(msg));
+}
+
+// 单个钍堆：由 scanWorld 在唯一那遍遍历里调用（不再自己遍历全图）
+function stepReactor(b, key, live) {
+    live[key] = true;
     var cfg0 = cfg();
-    if (!cfg0.enable) return;
-    var arr = null;
-    try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return; }
-    var n = seqSize(arr);
-    for (var i = 0; i < n; i++) {
-        var b = seqGet(arr, i);
-        if (b == null) continue;
-        if (blockNameOf(b) !== "thorium-reactor") continue;
-        var key = "";
-        try { key = b.tile.x + "," + b.tile.y; } catch (e) { key = "?" + i; }
-        var where0 = "第 " + LIB.toInt(key.split(",")[0], 0) + "," + LIB.toInt(key.split(",")[1], 0) + " 格";
+    {
+        var rec = GTB_REACTORS[key];
         // heat 是 0..1 的比例（NuclearReactor 里 heat >= 0.999 就 kill()），不是绝对值
         var heat = readNum(b, "heat", 0);
         GTB.stat.reactors = GTB.stat.reactors + 1;
         if (heat > 0.0001) GTB.stat.hot = GTB.stat.hot + 1;
+        var on = getEnabled(b) === true;
         if (cfg0.bh.reactorBoom && heat > 0.0001) {
-            var seen = GTB_REACTORS[key] == true;
-            if (getEnabled(b) !== true) {
-                // 已经停过：不重复通告、不重复处置，只补记
-                GTB_REACTORS[key] = true;
-                continue;
+            if (rec == null) {
+                var off = setEnabled(b, false);
+                GTB_REACTORS[key] = { byUs: off === true };
+                var pct = Math.round(heat * 1000) / 10;
+                var where0 = "第 " + LIB.toInt(key.split(",")[0], 0) + "," + LIB.toInt(key.split(",")[1], 0) + " 格";
+                dbg("reactor off " + key + " heat=" + pct + "% setEnabled=" + off + " owner=" + (GTB.builders[key] == null ? "-" : GTB.builders[key].name));
+                punishBuilder(GTB.builders[key], LIB.REASON.reactorBoom + "（热量 " + pct + "%）",
+                    "已停用" + where0 + "的钍堆：把钍取空或通入冷冻液后会自动恢复。");
+            } else if (on) {
+                // 玩家又把它打开了：再停一次，但不重复通告、不重复拉黑
+                setEnabled(b, false);
+                dbg("reactor re-off " + key);
             }
-            var off = setEnabled(b, false);
-            GTB_REACTORS[key] = true;
-            var pct = Math.round(heat * 1000) / 10;
-            dbg("reactor off " + key + " heat=" + pct + "% setEnabled=" + off + " seen=" + seen + " owner=" + (GTB.builders[key] == null ? "-" : GTB.builders[key].name));
-            if (seen) continue;
-            var owner = GTB.builders[key];
-            if (owner == null) {
-                broadcast(LIB.textInfo("发现正在升温的钍堆（" + where0 + "，热量 " + pct + "%），已停用。"));
-            } else {
-                var op = playerByUuid(owner.uuid);
-                if (op != null) punish(op, LIB.REASON.reactorBoom + "（热量 " + pct + "%）");
-                else addBlacklist(owner.uuid, owner.name, LIB.REASON.reactorBoom, true);
-                broadcast(LIB.textInfo("已停用远端的升温钍堆（热量 " + pct + "%）"));
+            return;
+        }
+        // 不再升温：只恢复「我们自己停的」，而且要先满足安全条件
+        if (rec != null && rec.byUs === true && !on) {
+            if (reactorSafe(b)) {
+                setEnabled(b, true);
+                delete GTB_REACTORS[key];
+                dbg("reactor restored " + key + " heat=" + Math.round(heat * 1000) / 10 + "%");
+            } else if (rec.waiting !== true) {
+                rec.waiting = true;
+                dbg("reactor held " + key + " (thorium left, no cryo)");
             }
-        } else if (heat <= 0.0001 && GTB_REACTORS[key] == true) {
-            setEnabled(b, true);
-            delete GTB_REACTORS[key];
-            dbg("reactor restored " + key);
         }
     }
 }
 
-function scanGenerators() {
-    var cfg0 = cfg();
-    if (!cfg0.enable || !cfg0.bh.blastGen) return;
-    var arr = null;
-    try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return; }
-    var n = seqSize(arr);
-    for (var i = 0; i < n; i++) {
-        var b = seqGet(arr, i);
-        if (b == null) continue;
-        var name = blockNameOf(b);
-        if (name !== "steam-generator" && name !== "combustion-generator" && name !== "turbine-generator") continue;
-        var count = 0;
-        try {
-            if (b.items != null) count = LIB.toInt(b.items.get(Items.blastCompound), 0);
-        } catch (e2) { count = 0; }
-        GTB.stat.gens = GTB.stat.gens + 1;
-        if (count <= 0) continue;
-        try { b.items.set(Items.blastCompound, 0); } catch (e3) { try { b.items.clear(); } catch (e4) { } }
-        setEnabled(b, false);
-        var key = "";
-        try { key = b.tile.x + "," + b.tile.y; } catch (e5) { key = "?" + i; }
-        var owner = GTB.builders[key];
-        var where = "第 " + LIB.toInt(key.split(",")[0], 0) + "," + LIB.toInt(key.split(",")[1], 0) + " 格";
-        if (owner != null) {
-            var op = playerByUuid(owner.uuid);
-            if (op != null) {
-                broadcast(LIB.textWarn(nameOf(op), LIB.REASON.blastGen + "：" + where + " 的" + (name === "steam-generator" ? "涡轮" : "发电机") + "已清空并停用"));
-                try { op.sendMessage(LIB.textWarn(nameOf(op), "别给发电机装爆混（" + where + "）")); } catch (e6) { }
-            }
-        } else {
-            broadcast(LIB.textInfo("已清空" + where + "发电机里的爆混并停用"));
-        }
+// 爆混发电机：不清空爆混，只停用。同一个方块只提示 / 拉黑一次，
+// 玩家再打开就静默再停 —— 这样「禁用的爆混火电或涡轮」不会再刷屏。
+function handleBlastGen(b, name, key) {
+    var on = getEnabled(b) === true;
+    var rec = GTB_GENS[key];
+    if (rec != null) {
+        if (on) setEnabled(b, false);
+        return false;
     }
+    var off = setEnabled(b, false);
+    GTB_GENS[key] = { byUs: off === true };
+    var where = "第 " + LIB.toInt(key.split(",")[0], 0) + "," + LIB.toInt(key.split(",")[1], 0) + " 格";
+    var lab = genLabel(name);
+    dbg("gen off " + key + " " + name + " setEnabled=" + off + " owner=" + (GTB.builders[key] == null ? "-" : GTB.builders[key].name));
+    punishBuilder(GTB.builders[key], LIB.REASON.blastGen + "（" + where + "的" + lab + "）",
+        "已停用" + where + "的" + lab + "：爆混不用清，保持停用就不会再提示。");
+    return true;
+}
+
+// 单个爆混发电机：同样由 scanWorld 调用
+function stepGen(b, name, key, live) {
+    live[key] = true;
+    GTB.stat.gens = GTB.stat.gens + 1;
+    var count = itemCount(b, Items.blastCompound);
+    var rec = GTB_GENS[key];
+    if (count <= 0) {
+        // 爆混被取走了：忘掉它，玩家想开就开
+        if (rec != null) delete GTB_GENS[key];
+        return;
+    }
+    handleBlastGen(b, name, key);
 }
 
 // ---------------------------------------------------------------- 行为：AFK
@@ -799,14 +931,19 @@ function tickVote() {
 // ---------------------------------------------------------------- 管理员自动移出黑名单
 
 function tickAdmins() {
-    var cfg0 = cfg();
     eachPlayer(function (p) {
         if (!isAdmin(p)) return;
         var uuid = uuidOf(p);
-        if (isBanned(uuid)) {
-            removeBlacklist(uuid, "已设为管理员");
-            try { p.sendMessage(LIB.textInfo("你已是管理员，已从 Grief to Ban 黑名单移出。")); } catch (e) { }
-        }
+        var banned = isBanned(uuid);
+        var hadTeam = GTB.origTeam[uuid] != null;
+        if (!banned && !hadTeam) return;
+        if (banned) removeBlacklist(uuid, "已设为管理员");
+        // 关键：拉黑时被转成了旁观，光移出黑名单人还站在队伍 0 —— 看起来就像「没移出」
+        var back = hadTeam ? restoreTeam(p) : false;
+        dbg("admin promoted " + nameOf(p) + " banned=" + banned + " team=" + back);
+        broadcast(LIB.textInfo("管理员 " + nameOf(p) + " 已移出黑名单" + (back ? "，并恢复到他原来的队伍" : "") + "。"));
+        try { p.sendMessage(LIB.textInfo("你已是管理员：已从 Grief to Ban 黑名单移出" + (back ? "，并恢复到你原来的队伍" : "") + "。")); } catch (e) { }
+        try { uiApi.rebuild(); } catch (e2) { }
     });
 }
 
@@ -857,6 +994,7 @@ function onLeave(p) {
 
 function onBuildEnd(e) {
     if (!isAuthority()) return;
+    if (inEditor()) return;                 // 编辑器：既不改 enabled，也不记建造者
     var cfg0 = cfg();
     if (!cfg0.enable) return;
     if (e.breaking === true) return;
@@ -874,14 +1012,22 @@ function onBuildEnd(e) {
         try { delete GTB_VIRUS[tileKey(e.tile)]; } catch (e9) { }
         checkVirus(b, p);
     }
-    if (blockNameOf(b) === "thorium-reactor") {
-        GTB.builders[tileKey(e.tile)] = { uuid: uuidOf(p), name: nameOf(p) };
-        checkReactorNear(b, p);
+    var bname = "";
+    try { bname = blockNameOf(b); } catch (e3) { bname = ""; }
+    // 建造者要记全：钍堆、爆混发电机的处置都得追得到人（原来只记钍堆，所以发电机没人被拉黑）
+    var bk = tileKey(e.tile);
+    if (bk !== "" && p != null) {
+        GTB.builders[bk] = { uuid: uuidOf(p), name: nameOf(p) };
+    }
+    if (bname === "thorium-reactor") { try { checkReactorNear(b, p); } catch (e4) { } }
+    if (isBlastGenName(bname) && bk !== "" && itemCount(b, Items.blastCompound) > 0) {
+        try { handleBlastGen(b, bname, bk); } catch (e5) { logErr("blast gen on build: " + e5); }
     }
 }
 
 function onConfig(e) {
     if (!isAuthority()) return;
+    if (inEditor()) return;
     var p = null;
     try { p = e.player; } catch (e1) { p = null; }
     var cfg0 = cfg();
@@ -897,13 +1043,14 @@ function onConfig(e) {
                     GTB.builders[tileKey(e.tile)] = { uuid: uuidOf(p), name: nameOf(p) };
                     checkReactorNear(b, p);
                 }
-                if (blockNameOf(b) === "steam-generator" || blockNameOf(b) === "combustion-generator") {
-                    var cnt = 0;
-                    try { cnt = LIB.toInt(b.items.get(Items.blastCompound), 0); } catch (e3) { cnt = 0; }
-                    if (cnt > 0) {
-                        try { b.items.set(Items.blastCompound, 0); } catch (e4) { try { b.items.clear(); } catch (e5) { } }
-                        setEnabled(b, false);
-                        broadcast(LIB.textWarn(nameOf(p), LIB.REASON.blastGen));
+                var bname2 = "";
+                try { bname2 = blockNameOf(b); } catch (eB) { bname2 = ""; }
+                if (isBlastGenName(bname2)) {
+                    var gk = tileKey(e.tile);
+                    if (gk !== "") {
+                        if (p != null) GTB.builders[gk] = { uuid: uuidOf(p), name: nameOf(p) };
+                        // 不清空爆混，只停用；同一个方块只提示 / 拉黑一次
+                        if (itemCount(b, Items.blastCompound) > 0) handleBlastGen(b, bname2, gk);
                     }
                 }
             }
@@ -931,29 +1078,66 @@ function refreshVanBan() {
 // 兜底：全图扫一遍已经存在的病毒逻辑（模组后加载 / 事件漏掉的情况）
 var GTB_VIRUS = {};
 
-function scanVirusQuick() {
+function stepLogic(b, key) {
+    GTB.stat.logic = GTB.stat.logic + 1;
+    if (GTB_VIRUS[key] === true) return;
+    var code = "";
+    try { code = b.code == null ? "" : String(b.code); } catch (e3) { return; }
+    if (!isVirusCode(code)) return;
+    GTB.stat.virus = GTB.stat.virus + 1;
+    var owner = GTB.builders[key];
+    var op = owner == null ? null : playerByUuid(owner.uuid);
+    // 停用与处置分开：没主 / 不在观察名单，也要把逻辑停掉
+    checkVirus(b, op);
+    if (owner != null && op == null) addBlacklist(owner.uuid, owner.name, LIB.REASON.virus, true);
+}
+
+// ---- 全图一次遍历：钍堆 + 爆混发电机 + 自复制逻辑，一遍走完 ----
+// 老实现是三个函数各遍历一遍 Groups.build（每遍 size() + 逐元素取值），大图上三倍开销。
+var GTB_PERF = { scan: 0, worst: 0, builds: 0 };
+var GTB_PUNISH = { n: 0, max: 6 };
+
+function nowNanos() {
+    try { return Packages.java.lang.System.nanoTime(); } catch (e) { return 0; }
+}
+
+function tileKeyOf(b, i) {
+    try { return b.tile.x + "," + b.tile.y; } catch (e) { return "?" + i; }
+}
+
+function scanWorld(now) {
+    GTB_PUNISH.n = 0;
     var cfg0 = cfg();
-    if (!cfg0.enable || !cfg0.bh.virus) return;
+    if (!cfg0.enable) return 0;
     var arr = null;
-    try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return; }
+    try { arr = Packages.mindustry.gen.Groups.build; } catch (e) { return 0; }
     var n = seqSize(arr);
+    GTB_PERF.builds = n;
+    var wantR = cfg0.bh.reactorBoom === true;
+    var wantG = cfg0.bh.blastGen === true;
+    var wantV = cfg0.bh.virus === true;
+    GTB.stat = { reactors: 0, hot: 0, logic: 0, virus: 0, gens: 0 };
+    if (!wantR && !wantG && !wantV) return n;
+    var liveR = {}, liveG = {};
+    var t0 = nowNanos();
     for (var i = 0; i < n; i++) {
-        var b = seqGet(arr, i);
-        if (b == null || !isLogicBuild(b)) continue;
-        GTB.stat.logic = GTB.stat.logic + 1;
-        var key = "";
-        try { key = b.tile.x + "," + b.tile.y; } catch (e2) { key = "?" + i; }
-        if (GTB_VIRUS[key] === true) continue;
-        var code = "";
-        try { code = b.code == null ? "" : String(b.code); } catch (e3) { continue; }
-        if (!isVirusCode(code)) continue;
-        GTB.stat.virus = GTB.stat.virus + 1;
-        var owner = GTB.builders[key];
-        var op = owner == null ? null : playerByUuid(owner.uuid);
-        // 停用与处置分开：没主 / 不在观察名单，也要把逻辑停掉
-        checkVirus(b, op);
-        if (owner != null && op == null) addBlacklist(owner.uuid, owner.name, LIB.REASON.virus, true);
+        var b = null;
+        try { b = arr.index(i); } catch (e2) { continue; }
+        if (b == null) continue;
+        var name = "";
+        try { name = blockNameOf(b); } catch (e3) { name = ""; }
+        if (wantR && name === "thorium-reactor") { stepReactor(b, tileKeyOf(b, i), liveR); continue; }
+        if (wantG && isBlastGenName(name)) { stepGen(b, name, tileKeyOf(b, i), liveG); continue; }
+        if (wantV && isLogicBuild(b)) { stepLogic(b, tileKeyOf(b, i)); }
     }
+    // 方块没了就忘掉记录，别让表一直变长
+    if (wantR) { for (var k in GTB_REACTORS) { if (GTB_REACTORS.hasOwnProperty(k) && liveR[k] !== true) delete GTB_REACTORS[k]; } }
+    if (wantG) { for (var k2 in GTB_GENS) { if (GTB_GENS.hasOwnProperty(k2) && liveG[k2] !== true) delete GTB_GENS[k2]; } }
+    var ms = (nowNanos() - t0) / 1000000;
+    GTB_PERF.scan = ms;
+    if (ms > GTB_PERF.worst) GTB_PERF.worst = ms;
+    if (ms >= 40) dbg("scan slow " + Math.round(ms) + "ms builds=" + n + " react=" + GTB.stat.reactors + " logic=" + GTB.stat.logic);
+    return n;
 }
 
 function tick() {
@@ -961,29 +1145,36 @@ function tick() {
     if (!isAuthority()) return;
     if (now - GTB.lastTick < 250) return;
     GTB.lastTick = now;
+    // 攒批落盘：日志每 500ms 一次，设置变更最多每 1.5s 一次 autosave
+    if (GTB_DBG_BUF.lines.length > 0 && now - GTB_DBG_BUF.at >= 500) dbgFlush();
+    flushSettings(now);
+    // 地图编辑器（单人沙盒）：整套防 grief 逻辑一行都不跑 —— 见 inEditor() 的注释。
+    // 注意放在落盘之后：编辑器里改设置也得存得住，只是不扫世界。
+    if (inEditor()) return;
     try { tickVote(); } catch (e) { logErr("vote: " + e); }
     try { tickAdmins(); } catch (e2) { logErr("admins: " + e2); }
     try { tickAfk(now); } catch (e3) { logErr("afk: " + e3); }
     // 1 秒一轮：钍堆从开始升温到炸只有几秒，3 秒轮询会漏
     if (now - GTB.lastScan >= 1000) {
         GTB.lastScan = now;
-        GTB.stat = { reactors: 0, hot: 0, logic: 0, virus: 0, gens: 0 };
         try { refreshVanBan(); } catch (e7) { }
-        try { scanReactors(); } catch (e4) { logErr("reactors: " + e4); }
-        try { scanGenerators(); } catch (e5) { logErr("gens: " + e5); }
-        try { scanVirusQuick(); } catch (e8) { logErr("virus sweep: " + e8); }
+        try { scanWorld(now); } catch (e4) { logErr("scan: " + e4); }
         try {
-            expose("gtb.scan", "builds=" + nBuilds() + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
+            expose("gtb.scan", "builds=" + GTB_PERF.builds + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
                 + " logic=" + GTB.stat.logic + " virus=" + GTB.stat.virus + " gens=" + GTB.stat.gens
+                + " ms=" + Math.round(GTB_PERF.scan) + " worst=" + Math.round(GTB_PERF.worst)
                 + " reactBoom=" + (cfg().bh.reactorBoom ? 1 : 0) + " virusOn=" + (cfg().bh.virus ? 1 : 0));
         } catch (eX) { }
         if (now - GTB_DBG.lastBeat >= 10000) {
             GTB_DBG.lastBeat = now;
             var c = cfg();
             dbg("beat " + authInfo() + " en=" + (c.enable ? 1 : 0) + " players=" + playerCount()
-                + " builds=" + nBuilds() + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
+                + " builds=" + GTB_PERF.builds + " react=" + GTB.stat.reactors + " hot=" + GTB.stat.hot
                 + " logic=" + GTB.stat.logic + " virus=" + GTB.stat.virus
-                + " list=" + c.blacklist.length + " watch=" + c.watch.length);
+                + " scan=" + Math.round(GTB_PERF.scan) + "ms worst=" + Math.round(GTB_PERF.worst) + "ms"
+                + " list=" + c.blacklist.length + " watch=" + c.watch.length
+                + " editor=" + (inEditor() ? 1 : 0));
+            dbgFlush();
         }
     }
     try { applyBlacklistToOnline(); } catch (e6) { }
@@ -1017,11 +1208,14 @@ function bindEvents() {
         GTB.win.clearAll();
         GTB.afk = {};
         GTB_REACTORS = {};
+        GTB_GENS = {};
         GTB_VIRUS = {};
         GTB.lastScan = 0;
         GTB.lastTick = 0;
         try { reload(); } catch (e) { }
-        dbg("world loaded " + authInfo());
+        dbg("world loaded " + authInfo() + (inEditor() ? " editor=1（编辑器里本模组不工作）" : ""));
+        try { dbgFlush(); } catch (e5) { }
+        try { flushSettings(nowMs()); } catch (e6) { }
     });
 }
 
@@ -1283,6 +1477,15 @@ function addPauseEntry(pd) {
     try {
         if (pd.cont == null) return false;
         pd.cont.row();
+        var icon = null;
+        try { icon = Packages.mindustry.gen.Icon.hammer; } catch (e1) { icon = null; }
+        if (icon != null) {
+            try {
+                // 带锤子图标（Icon 实现了 Drawable，Table.button(text, image, clicked)）
+                pd.cont.button("Grief to Ban", icon, openGtbDialog).size(220, 50).pad(5);
+                return true;
+            } catch (e2) { logErr("暂停菜单图标失败，退回纯文字：" + e2); }
+        }
         pd.cont.button("Grief to Ban", openGtbDialog).size(220, 50).pad(5);
         return true;
     } catch (e) {
@@ -1366,6 +1569,8 @@ function selfTest() {
         var gb = Packages.mindustry.gen.Groups.build;
         chk(seqSize(gb) >= 0, "seq size");
         chk(seqGet(gb, 0) !== undefined, "seq get/index");
+        chk(seqGet({ index: function (i) { return i === 0 ? "x" : null; } }, 0) === "x", "seqGet 先走 index()（EntityGroup 没有 get）");
+        chk(typeof scanWorld === "function" && typeof inEditor === "function" && typeof flushSettings === "function", "perf/editor helpers");
     } catch (eQ) { lines.push("FAIL seq: " + eQ); fails.push("seq"); }
     // 黑名单落盘这条路：写进去 → 从 Core.settings 读回 → 再删掉（只在 GTB_SELFTEST 时跑）
     try {

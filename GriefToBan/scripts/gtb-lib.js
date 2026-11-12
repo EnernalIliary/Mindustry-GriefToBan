@@ -3,7 +3,7 @@
 // 编码约束：本文件会被 Mindustry 的 Rhino 加载，只允许 ES5 写法（var / function），
 // 禁止正则字面量（Rhino 构造期会 FAILED ASSERTION: invalid bytecode），一律手写字符扫描。
 
-var VERSION = "0.1.2";
+var VERSION = "0.1.3";
 var P = "grief-to-ban.";
 
 // 设置键（存进 Core.settings）
@@ -499,8 +499,8 @@ var REASON = {
     interact: "短时间大量交互/指挥",
     virus: "放置病毒逻辑（@this 自复制）",
     reactorNear: "钍堆离核心太近",
-    reactorBoom: "钍堆热量不为 0（随时会炸）",
-    blastGen: "给涡轮/火电装爆混",
+    reactorBoom: "钍堆在烧钍、没通冷冻液（随时会炸）",
+    blastGen: "涡轮/火电里装着爆混",
     afk: "附身单位 AFK 过久",
     lang: "语言黑名单"
 };
