@@ -40,6 +40,35 @@ function txt(s){
     return String(s);
 }
 
+// CJK 字符判定（汉字 / 中日韩标点 / 全角标点）
+function isCjkChar(ch){
+    if(ch === null || ch === undefined || ch === "") return false;
+    var c = ch.charCodeAt(0);
+    if(c >= 0x2E80 && c <= 0x9FFF) return true;   // 部首、汉字
+    if(c >= 0xF900 && c <= 0xFAFF) return true;   // 兼容汉字
+    if(c >= 0xFE30 && c <= 0xFE4F) return true;   // 竖排标点
+    if(c >= 0xFF00 && c <= 0xFF65) return true;   // 全角标点/字母
+    return false;
+}
+
+// 中英文之间的半角空格会让 arc 的折行停在空格处（GlyphLayout.getWrapIndex 往回找空格），
+// 中文段落里空格很少，于是常断出「基于 uid」这种极短的一行。把紧贴中文的空格去掉后，
+// 这段文字没有任何断点，Arc 就按字符宽度硬折行，中文段落看起来才是正常的。
+function cjkTighten(s){
+    var st = txt(s);
+    var out = "";
+    for(var i = 0; i < st.length; i++){
+        var ch = st.charAt(i);
+        if(ch === " "){
+            var prev = i > 0 ? st.charAt(i - 1) : "";
+            var next = i + 1 < st.length ? st.charAt(i + 1) : "";
+            if(isCjkChar(prev) || isCjkChar(next)) continue;
+        }
+        out += ch;
+    }
+    return out;
+}
+
 // Rhino 里 Java boolean 一般已经转成 JS boolean，但复选框回调再兜一层
 function truthy(v){
     if(v === true) return true;
@@ -218,7 +247,7 @@ function section(title){
 function subLine(text){
     if(nil(T)) return;
     try {
-        var cell = T.labelWrap(txt(text));
+        var cell = T.labelWrap(cjkTighten(text));
         try { cell.width(ROW_W - 16); } catch(e1){ }
         try { cell.left(); cell.padLeft(16); cell.padTop(1); } catch(e2){ }
         cellColor(cell, grayColor());
@@ -231,7 +260,7 @@ function subLine(text){
 function descLine(text){
     if(nil(T)) return;
     try {
-        var cell = T.labelWrap(txt(text));
+        var cell = T.labelWrap(cjkTighten(text));
         try { cell.width(ROW_W); } catch(e1){ }
         try { cell.left(); cell.padTop(4); } catch(e2){ }
         cellColor(cell, grayColor());

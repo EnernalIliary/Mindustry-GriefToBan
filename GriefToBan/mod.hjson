@@ -2,7 +2,7 @@ name: "grief-to-ban"
 displayName: "Grief to Ban"
 author: "Iliary艾铭&DeepSeek"
 description: "反破坏：基于 uid 的黑名单，进名单直接转旁观（队伍 0）；语言/行为自动识别（病毒逻辑、钍堆、爆混发电机、AFK、刷交互），/vote kick 期间自动旁观。"
-version: "0.1.7"
+version: "0.1.8"
 minGameVersion: "146"
 # hidden: true —— 自用模组，不上报给服务器（Mods.getModStrings 只收 !meta.hidden），
 # 联机不会被 "Incompatible mods" 提示踢掉；hidden 只跳过 loadContent()（不能注册新方块/单位），

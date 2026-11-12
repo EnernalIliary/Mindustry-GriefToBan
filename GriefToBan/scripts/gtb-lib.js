@@ -3,7 +3,7 @@
 // 编码约束：本文件会被 Mindustry 的 Rhino 加载，只允许 ES5 写法（var / function），
 // 禁止正则字面量（Rhino 构造期会 FAILED ASSERTION: invalid bytecode），一律手写字符扫描。
 
-var VERSION = "0.1.7";
+var VERSION = "0.1.8";
 var P = "grief-to-ban.";
 
 // 设置键（存进 Core.settings）
